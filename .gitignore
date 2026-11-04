@@ -1,4 +1,7 @@
 # Private input data and generated student documents
+*.xlsx
+*.docx
+*.pdf
 
 output/
 
