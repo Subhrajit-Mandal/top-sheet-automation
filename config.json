@@ -1,0 +1,81 @@
+{
+  "exam_date": "19-09-2026",
+  "full_marks": 25,
+  "font_mode": "template",
+  "custom_font": {
+    "name": "Calibri",
+    "size_pt": null
+  },
+  "columns": {
+    "roll_number": "UNI Roll number",
+    "name": "Name",
+    "marks_obtained": "Marks Obtained"
+  },
+  "absent_markers": [
+    "Ab"
+  ],
+  "template_fields": [
+    {
+      "label": "Name of the Student:",
+      "column": "Name"
+    },
+    {
+      "label": "Roll Number:",
+      "column": "UNI Roll number"
+    },
+    {
+      "label": "Mobile Number:",
+      "column": "Mobile Number"
+    },
+    {
+      "label": "Marks obtained:",
+      "column": "Marks Obtained"
+    },
+    {
+      "label": "Date of Examination:",
+      "value": "{exam_date}"
+    },
+    {
+      "label": "Paper (course) Code:",
+      "value": ""
+    },
+    {
+      "label": "Subject Teacher:",
+      "value": ""
+    },
+    {
+      "label": "UPID:",
+      "value": ""
+    }
+  ],
+  "marks_table": {
+    "question_header": "Q. No.",
+    "allotted_header": "Marks Allotted",
+    "awarded_header": "Marks Awarded"
+  },
+  "ignore_question_labels": [
+    "total",
+    "grand total"
+  ],
+  "signature": {
+    "enabled": true,
+    "label": "Signature of the student with date",
+    "fonts": [
+      "Brush Script MT",
+      "Freestyle Script",
+      "Lucida Handwriting",
+      "Mistral",
+      "Viner Hand ITC"
+    ],
+    "name_size_pt": 16,
+    "date_size_pt": 9
+  },
+  "duplicates": "stop",
+  "existing_files": "overwrite",
+  "unreachable_marks": "stop",
+  "full_marks_label": "Full Marks:",
+  "mobile_check": {
+    "column": "Mobile Number",
+    "digits": 10
+  }
+}

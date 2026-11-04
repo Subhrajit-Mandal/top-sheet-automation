@@ -1,0 +1,12 @@
+# Private input data and generated student documents
+
+output/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local editor settings
+.venv/
+venv/
+.vscode/
