@@ -86,6 +86,18 @@ def read_marks(template: Path, cfg: dict) -> g.MarksTable:
     return g.find_marks_table(Document(template), cfg)[1]
 
 
+def feeder(*replies):
+    """A fake input(): returns the replies in order, then behaves like a closed stdin."""
+    remaining = iter(replies)
+
+    def fake_input(prompt=""):
+        try:
+            return next(remaining)
+        except StopIteration:
+            raise EOFError from None
+    return fake_input
+
+
 def quiet(function, *args, **kwargs):
     with redirect_stdout(io.StringIO()) as buffer:
         result = function(*args, **kwargs)
@@ -404,21 +416,20 @@ class EndToEnd(TempCase):
                             '{"label": "Roll Number:", "column": "UNI Roll number"},'
                             '{"label": "Mobile Number:", "column": "Mobile Number"},'
                             '{"label": "Marks obtained:", "column": "Marks Obtained"},'
-                            '{"label": "Date of Examination:", "value": "{exam_date}"}]}')
+                            '{"label": "Date of Examination:", "value": "{exam_date}"},'
+                            '{"label": "Paper (course) Code:", "value": ""}]}')
 
-    def go(self, *extra, answers=("", "5", "4", "")):
-        feed = iter(answers)
-
-        def fake_input(prompt):
-            try:
-                return next(feed)
-            except StopIteration:
-                raise EOFError
-
+    def go(self, *extra, answers=("", "5", "4", ""), screen=False):
         argv = ["--workbook", str(self.workbook), "--template", str(self.template),
                 "--output", str(self.out), "--config", str(self.cfg), "--keep-docx-only",
                 "--workers", "1", *extra]
-        return quiet(g.run, g.parse_args(argv), fake_input)
+        if not screen:
+            argv.append("--no-prompt")
+        return quiet(g.run, g.parse_args(argv), feeder(*answers))
+
+    def sheet_text(self, name="1_A.docx") -> str:
+        document = Document(self.out / "docx" / name)
+        return "\n".join(p.text for p in g.iter_template_paragraphs(document))
 
     def test_full_run_and_saved_rules(self):
         (code, text) = self.go()
@@ -497,9 +508,198 @@ class EndToEnd(TempCase):
             g.load_config(self.cfg)
         self.assertIn("exam_dat", str(caught.exception))
 
+    # ---- settings screen, end to end -------------------------------------
+    # Answer order for a first run: screen replies..., [save?], then the section
+    # questions: accept grouping "", 5, 4, save section rules "".
+
+    def test_screen_answers_reach_the_sheets_and_are_saved(self):
+        code, text = self.go(screen=True, answers=("1", "5-9-2026", "3", "ME-301", "", "",
+                                                   "", "5", "4", ""))
+        self.assertEqual(code, 0, text)
+        sheet = self.sheet_text()
+        self.assertIn("Date of Examination: 05-09-2026", sheet)
+        self.assertIn("Paper (course) Code: ME-301", sheet)
+        self.assertEqual(sheet.count("05-09-2026"), 2)  # the field and under the signature
+
+        local = g.json.loads((self.dir / "config.local.json").read_text())
+        self.assertEqual(local["exam_date"], "05-09-2026")
+        self.assertEqual(local["fixed_values"], {"Paper (course) Code:": "ME-301"})
+        # the shipped file is never written to
+        self.assertNotIn("exam_date", g.json.loads(self.cfg.read_text()))
+
+        # next run: saved values are used, no screen needed
+        self.go(answers=())
+        self.assertIn("Date of Examination: 05-09-2026", self.sheet_text())
+
+    def test_declining_to_save_applies_to_this_run_only(self):
+        code, _ = self.go(screen=True, answers=("1", "05-09-2026", "", "n", "", "5", "4", ""))
+        self.assertEqual(code, 0)
+        self.assertIn("Date of Examination: 05-09-2026", self.sheet_text())
+        self.assertFalse((self.dir / "config.local.json").exists())
+
+    def test_no_changes_means_nothing_to_save(self):
+        code, text = self.go(screen=True, answers=("", "", "5", "4", ""))
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("Save these changes", text)
+        self.assertFalse((self.dir / "config.local.json").exists())
+
+    def test_no_one_answering_continues_with_the_settings_shown(self):
+        code, text = self.go("--answer", "5,4", screen=True, answers=())
+        self.assertEqual(code, 0, text)
+        self.assertIn("No one is answering", text)
+
+    def test_no_prompt_skips_the_screen(self):
+        _, text = self.go()
+        self.assertNotIn("Settings for this run", text)
+
+    def test_screen_is_skipped_in_check_mode(self):
+        _, text = self.go("--check", screen=True, answers=())
+        self.assertNotIn("Settings for this run", text)
+
+    def test_blank_exam_date_is_a_warning_not_a_guess(self):
+        code, text = self.go()
+        self.assertEqual(code, 0, text)
+        self.assertIn("exam date is empty", text)
+        self.assertEqual(
+            [l for l in self.sheet_text().splitlines() if "Date of Examination" in l][0].strip(),
+            "Date of Examination:")
+
+    def test_template_full_marks_is_offered_as_the_default(self):
+        self.template = make_template(self.dir / "t30.docx", YOURS, full_marks="30")
+        _, text = self.go(screen=True, answers=("", "", "5", "4", ""))
+        self.assertIn("Full marks 30 was read from the template", text)
+
+    def test_an_explicit_full_marks_wins_over_the_template(self):
+        self.template = make_template(self.dir / "t30.docx", YOURS, full_marks="30")
+        (self.dir / "config.local.json").write_text('{"full_marks": 25}')
+        _, text = self.go(screen=True, answers=("", "", "5", "4", ""))
+        self.assertNotIn("was read from the template", text)
+        self.assertIn("the template itself says Full Marks: 30", text)
+
     def test_shipped_config_matches_the_code_defaults(self):
         shipped = g.json.loads((g.HERE / "config.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(shipped, g.DEFAULT_CONFIG)
+
+
+class SettingsScreen(unittest.TestCase):
+    def run_screen(self, *replies, cfg=None, **kwargs):
+        cfg = cfg or config()
+        changes: dict = {}
+        quiet(g.review_settings, cfg, changes, input_fn=feeder(*replies), **kwargs)
+        return cfg, changes
+
+    def test_lists_only_what_a_person_would_type(self):
+        titles = [title for _, title, _ in g.settings_rows(config())]
+        self.assertEqual(titles, ["Exam date", "Full marks", "Paper (course) Code", "Font mode"])
+        # derived or column-fed labels are not offered
+
+    def test_exam_date_is_normalised(self):
+        cfg, changes = self.run_screen("1", "2-9-2026", "")
+        self.assertEqual(cfg["exam_date"], "02-09-2026")
+        self.assertEqual(changes, {"exam_date": "02-09-2026"})
+
+    def test_an_odd_date_needs_confirmation(self):
+        cfg, _ = self.run_screen("1", "Sept 2nd", "n", "")
+        self.assertEqual(cfg["exam_date"], "")
+        cfg, changes = self.run_screen("1", "Sept 2nd", "y", "")
+        self.assertEqual(cfg["exam_date"], "Sept 2nd")
+
+    def test_enter_keeps_and_dash_clears(self):
+        cfg = config()
+        cfg["exam_date"] = "01-01-2027"
+        cfg, changes = self.run_screen("1", "", "", cfg=cfg)
+        self.assertEqual(cfg["exam_date"], "01-01-2027")
+        self.assertEqual(changes, {})
+        cfg, changes = self.run_screen("1", "-", "", cfg=cfg)
+        self.assertEqual(cfg["exam_date"], "")
+
+    def test_full_marks_must_be_a_whole_number(self):
+        cfg, changes = self.run_screen("2", "abc", "2", "0", "2", "30", "")
+        self.assertEqual(cfg["full_marks"], 30)
+        self.assertEqual(changes, {"full_marks": 30})
+
+    def test_fixed_field_updates_the_template_entry_and_the_overlay(self):
+        cfg, changes = self.run_screen("3", "ME-301", "")
+        entry = next(e for e in cfg["template_fields"] if e["label"] == "Paper (course) Code:")
+        self.assertEqual(entry["value"], "ME-301")
+        self.assertEqual(changes, {"fixed_values": {"Paper (course) Code:": "ME-301"}})
+
+    def test_font_mode_custom_asks_for_the_name(self):
+        cfg, changes = self.run_screen("4", "2", "Arial", "")
+        self.assertEqual((cfg["font_mode"], cfg["custom_font"]["name"]), ("custom", "Arial"))
+        self.assertEqual(changes, {"font_mode": "custom", "custom_font": {"name": "Arial"}})
+        cfg, changes = self.run_screen("4", "1", "", cfg=cfg)
+        self.assertEqual(cfg["font_mode"], "template")
+
+    def test_a_wrong_menu_choice_is_not_fatal(self):
+        cfg, changes = self.run_screen("9", "x", "")
+        self.assertEqual(changes, {})
+
+    def test_closing_input_mid_way_raises_for_the_caller_to_handle(self):
+        with self.assertRaises(EOFError):
+            quiet(g.review_settings, config(), {}, input_fn=feeder())
+
+
+class WrongFiles(TempCase):
+    def test_a_wrong_template_file_gives_a_readable_error(self):
+        bad = self.dir / "t.docx"
+        bad.write_bytes(b"not a word file")
+        with self.assertRaises(g.UserError) as caught:
+            g.open_template(bad)
+        self.assertIn("t.docx", str(caught.exception))
+
+    def test_a_wrong_workbook_file_gives_a_readable_error(self):
+        bad = self.dir / "w.xlsx"
+        bad.write_bytes(b"not an excel file")
+        with self.assertRaises(g.UserError) as caught:
+            g.read_students(bad, None, config())
+        self.assertIn("w.xlsx", str(caught.exception))
+
+
+class LocalConfig(TempCase):
+    def test_local_file_overrides_the_shipped_one(self):
+        shipped = self.dir / "config.json"
+        shipped.write_text('{"exam_date": "01-01-2026", "full_marks": 30}')
+        (self.dir / "config.local.json").write_text('{"exam_date": "02-02-2027"}')
+        cfg = g.load_config(shipped)
+        self.assertEqual((cfg["exam_date"], cfg["full_marks"]), ("02-02-2027", 30))
+
+    def test_a_typo_in_the_local_file_names_the_file(self):
+        shipped = self.dir / "config.json"
+        shipped.write_text("{}")
+        (self.dir / "config.local.json").write_text('{"exam_dat": "x"}')
+        with self.assertRaises(g.UserError) as caught:
+            g.load_config(shipped)
+        self.assertIn("config.local.json", str(caught.exception))
+        self.assertIn("exam_dat", str(caught.exception))
+
+    def test_fixed_values_must_name_a_fixed_field(self):
+        shipped = self.dir / "config.json"
+        shipped.write_text('{"fixed_values": {"Nope:": "x"}}')
+        with self.assertRaises(g.UserError):
+            g.load_config(shipped)
+        shipped.write_text('{"fixed_values": {"Name of the Student:": "x"}}')  # fed by a column
+        with self.assertRaises(g.UserError):
+            g.load_config(shipped)
+
+    def test_saving_merges_and_keeps_other_settings(self):
+        shipped = self.dir / "config.json"
+        shipped.write_text("{}")
+        local = self.dir / "config.local.json"
+        local.write_text('{"exam_date": "x", "fixed_values": {"UPID:": "1"}, "font_mode": "custom"}')
+        g.save_local_config(shipped, {"fixed_values": {"Paper (course) Code:": "ME"}, "full_marks": 30})
+        saved = g.json.loads(local.read_text())
+        self.assertEqual(saved["exam_date"], "x")
+        self.assertEqual(saved["font_mode"], "custom")
+        self.assertEqual(saved["fixed_values"], {"UPID:": "1", "Paper (course) Code:": "ME"})
+        self.assertEqual(saved["full_marks"], 30)
+
+    def test_local_and_rules_files_are_git_ignored(self):
+        ignore = (g.HERE / ".gitignore")
+        if ignore.exists():  # the packaged copy ships it; a bare checkout of the script may not
+            text = ignore.read_text()
+            self.assertIn("config.local.json", text)
+            self.assertIn("section_rules.json", text)
 
 
 if __name__ == "__main__":

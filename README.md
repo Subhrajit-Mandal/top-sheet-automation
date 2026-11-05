@@ -4,7 +4,7 @@ Generate one completed Word top sheet and PDF per student from any Excel workboo
 
 The workbook and template are supplied at runtime, so their filenames and locations are entirely up to the user. Original input files are never changed.
 
-Nothing about the sheet's layout is hard-coded. What gets filled, which workbook column feeds which label, the exam date, the full marks, the fonts and the duplicate rules all live in [`config.json`](config.json). The question rows and their marks are read from the template itself, so a top sheet with more rows or fewer columns works without touching the code.
+Nothing about the sheet's layout is hard-coded. What gets filled, which workbook column feeds which label, the exam date, the full marks, the fonts and the duplicate rules all live in [`config.json`](config.json). The values that change from exam to exam are asked for when you start a run, so you rarely need to edit a config file by hand. The question rows and their marks are read from the template itself, so a top sheet with more rows or fewer columns works without touching the code.
 
 ## Features
 
@@ -12,6 +12,7 @@ Nothing about the sheet's layout is hard-coded. What gets filled, which workbook
 - Fills the labels you declare in `config.json` in a DOCX top-sheet template, keeping the template's own font and formatting (or a custom font, your choice).
 - Reads the question rows and their `Marks Allotted` from the template's marks table, groups them into sections ("answer any 5 of 1.a to 1.g"), and spreads each student's total across the answered questions so that it adds up exactly.
 - Adds a typed student signature in one of five handwriting-style fonts, with the examination date beneath it.
+- Asks for the per-exam values (exam date, full marks, paper code, subject teacher, font) on a short settings screen at the start of each run, and can remember your answers.
 - Checks the whole workbook before generating anything: duplicate roll numbers, bad marks, missing columns, missing template labels.
 - Creates files named `Rollnumber_Name.docx` and `Rollnumber_Name.pdf`, and checks for filename collisions.
 - Writes a `run_report.csv` with every student's question-wise marks and status.
@@ -41,23 +42,50 @@ Two standard file pickers will open in sequence:
 1. Choose the student Excel workbook (`.xlsx`).
 2. Choose the Word top-sheet template (`.docx`).
 
+Next comes a short settings screen (see [Settings screen](#settings-screen)). Press Enter to accept the values shown, or type a number to change one.
+
 The first time a template is used, the program shows the question sections it found and asks how many questions are to be answered in each (see [Sections](#sections-answer-any-n)). The answers are saved, so later runs with the same template do not ask again.
 
 The generated files are written to `output\docx` and `output\pdf`. Input filenames do not need to match any predefined names.
 
+## Settings screen
+
+At the start of every interactive run the program shows the values that usually change from exam to exam:
+
+```
+Settings for this run
+  1. Exam date                02-09-2026
+  2. Full marks               25
+  3. Paper (course) Code      (blank)
+  4. Subject Teacher          (blank)
+  5. UPID                     (blank)
+  6. Font mode                template
+
+Press Enter to continue, or type a number to change it:
+```
+
+- Press Enter to carry on, or type a line's number to change it. At a value prompt, Enter keeps the current value and `-` clears it.
+- The exam date is checked as `DD-MM-YYYY` (`2-9-2026` becomes `02-09-2026`). Any other format is accepted only after you confirm it.
+- If the template states its own "Full Marks: N" text and you have not set a value yourself, that number is offered as the full marks. If you have set a different one, the screen points out the difference. Nothing is ever filled from the template without showing it here.
+- Every fixed-value entry in `template_fields` appears on the screen automatically, except derived ones such as `{exam_date}`. Add a field to the config and it shows up here.
+- After a change you are asked whether to save it. **Saved answers go to `config.local.json`**, a file beside `config.json` that is ignored by git, so personal values never reach the repository. It overrides `config.json` setting by setting, and it is safe to delete to start again.
+- The screen is skipped with `--no-prompt`, with `--check`, and when nobody is there to answer. Those runs use `config.json` and `config.local.json` exactly as they are.
+- The shipped `config.json` has no exam date, so the first run always asks. If the date is still empty, the "Date of Examination" field and the date under the signature are left blank, with a warning.
+
 ## Configuration (`config.json`)
 
-Every value that may change between exams is here. Settings you leave out use the built-in default, and a misspelt setting name is rejected with an error rather than ignored.
+Every value that may change between exams is here. Settings you leave out use the built-in default, and a misspelt setting name is rejected with an error rather than ignored. `config.local.json` (written by the settings screen, or by hand) uses the same setting names and is checked just as strictly.
 
 | Setting | Meaning |
 | --- | --- |
-| `exam_date` | Printed in any field whose value is `{exam_date}` and under the signature |
+| `exam_date` | Printed in any field whose value is `{exam_date}` and under the signature; empty in the shipped config |
 | `full_marks` | Highest total a student can have; totals above it are errors |
 | `font_mode` | `"template"` copies the template's own font; `"custom"` uses `custom_font` for everything the program fills in |
 | `custom_font` | `name` and optional `size_pt` used in `"custom"` mode |
 | `columns` | Workbook headers for `roll_number` (primary key), `name` and `marks_obtained` |
 | `absent_markers` | Values in the marks column that mean absent, for example `["Ab"]` |
 | `template_fields` | The labels to fill, see below |
+| `fixed_values` | Overrides for fixed-value labels, as `{"Subject Teacher:": "Dr. A. Sen"}`. Normally written by the settings screen into `config.local.json` |
 | `marks_table` | Header texts of the marks table in the template; `null` switches question-wise marks off |
 | `ignore_question_labels` | Marks-table rows with these labels (for example `total`) are not questions |
 | `signature` | `enabled`, the label to insert above, the five fonts, and the name and date sizes |
@@ -78,6 +106,7 @@ Each entry in `template_fields` links one template label to either a workbook co
 { "label": "UPID:",               "value": "" }
 ```
 
+- Fixed values can be typed on the [settings screen](#settings-screen) instead of editing the config.
 - A `column` must match a workbook header exactly. A `value` of `""` leaves that label exactly as the template has it.
 - **Nothing is matched by guesswork.** If a declared header or label is missing, the run stops and the message names what was not found and what was found instead. Labels that are not declared are never touched.
 - The value replaces everything after the label in its paragraph; the label and anything before it stay.
@@ -127,7 +156,7 @@ A student's total can range from 9 to 25 under these rules (full marks in the co
 - Rows with sub-part labels (`1.a)`, `1.b)` ...) form one section, and consecutive plain numbers (`2`, `3`, `4` ...) form another. If that grouping is wrong, type your own row ranges at the prompt, for example `1-7,8-13`.
 - In every section **exactly N** questions are answered, each with at least 1 mark and at most its `Marks Allotted`. The other questions stay blank. The marks add up exactly to `Marks Obtained`.
 - The reachable range is shown. A total outside it (for example 5 when N = 5 and 4 means at least 9) cannot be split, so the run stops and names the student (`"unreachable_marks": "skip"` skips them instead). `Ab` leaves every question blank.
-- The answers are saved in `section_rules.json`, tied to a fingerprint of the template's question rows. A different template asks again; `--ask-sections` forces the questions for the current one. `--answer 5,4` supplies the numbers without prompting.
+- The answers are saved in `section_rules.json` (ignored by git), tied to a fingerprint of the template's question rows. A different template asks again; `--ask-sections` forces the questions for the current one. `--answer 5,4` supplies the numbers without prompting.
 - The split is varied but repeatable for a given roll number, template and rules.
 
 ## Checking before generating
@@ -180,6 +209,7 @@ py .\generate_top_sheets.py --workbook ".\students.xlsx" --template ".\template.
 | --- | --- |
 | `--config PATH` | Use another config file (default: `config.json` beside the script) |
 | `--check` | Validate and report only |
+| `--no-prompt` | Skip the settings screen and use the config files as they are |
 | `--answer 5,4` | Questions to answer per section, without prompting |
 | `--ask-sections` | Ask about the sections again even if rules are saved |
 | `--pdf-engine` | `auto` (default), `word` or `libreoffice`; `auto` uses Word when available, otherwise LibreOffice |

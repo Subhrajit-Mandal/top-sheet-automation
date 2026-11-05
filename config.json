@@ -1,5 +1,5 @@
 {
-  "exam_date": "19-09-2026",
+  "exam_date": "",
   "full_marks": 25,
   "font_mode": "template",
   "custom_font": {
@@ -48,6 +48,7 @@
       "value": ""
     }
   ],
+  "fixed_values": {},
   "marks_table": {
     "question_header": "Q. No.",
     "allotted_header": "Marks Allotted",

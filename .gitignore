@@ -13,3 +13,7 @@ __pycache__/
 .venv/
 venv/
 .vscode/
+
+# Per-user settings saved by the program (not for the repository)
+config.local.json
+section_rules.json
