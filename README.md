@@ -1,5 +1,7 @@
 # CA1 Top Sheets Automation
 
+[![tests](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml/badge.svg)](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml)
+
 Generate one completed Word top sheet and PDF per student from any Excel workbook and compatible DOCX template.
 
 The workbook and template are supplied at runtime, so their filenames and locations are entirely up to the user. Original input files are never changed.
@@ -286,7 +288,7 @@ This tool prepares CA1 top sheets from a workbook of marks and a template that y
 - **The question-wise marks are generated.** They are spread randomly within each question's allotted marks so that they add up to the total in the workbook. They are not an examiner's own question-by-question assessment.
 - **The typed signature is generated.** It is the student's name in a handwriting-style font, not a handwritten signature. Set `"signature": {"enabled": false}` in the config to leave it out.
 
-Use the tool only where your institution permits sheets to be prepared this way, and do not present generated content as an examiner's or a student's original record. The software is provided as is, without warranty (see [LICENSE](../LICENSE)).
+Use the tool only where your institution permits sheets to be prepared this way, and do not present generated content as an examiner's or a student's original record. The software is provided as is, without warranty (see [LICENSE](LICENSE)).
 
 ## Version
 
