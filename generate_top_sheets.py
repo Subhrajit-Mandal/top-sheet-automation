@@ -29,7 +29,7 @@ import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,7 +51,8 @@ REPORT_FILENAME = "run_report.csv"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Printed in the "Date of Examination" field and under the signature.
-    "exam_date": "19-09-2026",
+    # Empty by default: the settings screen asks for it at the start of a run.
+    "exam_date": "",
     # Maximum marks a student can obtain (checked against the workbook).
     "full_marks": 25,
     # "template": copy the font of the template's own label text.
@@ -69,6 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Every label the program fills. Use "column" (exact workbook header) or
     # "value" (fixed text; {exam_date} and {full_marks} are expanded).
     # A fixed value of "" leaves that label exactly as the template has it.
+    # (The settings screen saves its answers for fixed values in "fixed_values".)
     "template_fields": [
         {"label": "Name of the Student:", "column": "Name"},
         {"label": "Roll Number:", "column": "UNI Roll number"},
@@ -79,6 +81,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {"label": "Subject Teacher:", "value": ""},
         {"label": "UPID:", "value": ""},
     ],
+    # Overrides for fixed-value labels, as {"label": "text"}. Normally written
+    # by the settings screen into config.local.json, not edited by hand.
+    "fixed_values": {},
     # Header texts of the marks table inside the template.
     # Set to null to switch question-wise marks off.
     "marks_table": {
@@ -126,18 +131,20 @@ def info(message: str = "") -> None:
 # Configuration
 # --------------------------------------------------------------------------
 
-def merge_config(base: dict, override: dict, path: str = "config") -> dict:
+def merge_config(base: dict, override: dict, where: str = "config.json", prefix: str = "") -> dict:
     result = copy.deepcopy(base)
     for key, value in override.items():
         if key.startswith("_"):  # free-form notes are allowed
             continue
         if key not in base:
             raise UserError(
-                f"Unknown setting '{path}.{key}'. "
+                f"Unknown setting '{prefix}{key}' in {where}. "
                 f"Valid settings here: {', '.join(base)}."
             )
-        if isinstance(base[key], dict) and isinstance(value, dict):
-            result[key] = merge_config(base[key], value, f"{path}.{key}")
+        if key == "fixed_values" and isinstance(value, dict):
+            result[key] = {**result[key], **value}
+        elif isinstance(base[key], dict) and isinstance(value, dict):
+            result[key] = merge_config(base[key], value, where, f"{prefix}{key}.")
         else:
             result[key] = value
     return result
@@ -156,6 +163,8 @@ def validate_config(config: dict) -> None:
     one_of("existing_files", ("overwrite", "skip"))
     one_of("unreachable_marks", ("stop", "skip"))
 
+    if not isinstance(config["exam_date"], str):
+        raise UserError('config.exam_date must be text, for example "02-09-2026".')
     if not isinstance(config["full_marks"], int) or config["full_marks"] < 1:
         raise UserError("config.full_marks must be a whole number of at least 1.")
     if config["font_mode"] == "custom" and not str(config["custom_font"]["name"] or "").strip():
@@ -183,6 +192,16 @@ def validate_config(config: dict) -> None:
             raise UserError(f"{where}: label '{entry['label']}' is declared twice.")
         seen_labels.add(entry["label"])
 
+    fixed_labels = [e["label"] for e in config["template_fields"] if "value" in e]
+    for label, value in config["fixed_values"].items():
+        if label not in fixed_labels:
+            raise UserError(
+                f"config.fixed_values has '{label}', which is not a fixed-value entry in "
+                f"template_fields. Fixed-value labels: {', '.join(fixed_labels) or '(none)'}."
+            )
+        if not isinstance(value, str):
+            raise UserError(f"config.fixed_values['{label}'] must be text.")
+
     table = config["marks_table"]
     if table is not None:
         for key in ("question_header", "allotted_header", "awarded_header"):
@@ -190,21 +209,65 @@ def validate_config(config: dict) -> None:
                 raise UserError(f"config.marks_table.{key} must not be empty.")
 
 
-def load_config(path: Path | None) -> dict:
-    config_path = path or DEFAULT_CONFIG_PATH
-    if not config_path.exists():
-        if path is not None:
-            raise UserError(f"Config file not found: {config_path}")
-        return copy.deepcopy(DEFAULT_CONFIG)
+def local_config_path(path: Path | None) -> Path:
+    """config.json -> config.local.json beside it (git-ignored, one per user)."""
+    base = path or DEFAULT_CONFIG_PATH
+    return base.with_name(f"{base.stem}.local{base.suffix}")
+
+
+def read_json_object(path: Path) -> dict:
     try:
-        override = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as error:
-        raise UserError(f"{config_path.name} is not valid JSON: {error}") from error
-    if not isinstance(override, dict):
-        raise UserError(f"{config_path.name} must contain a JSON object.")
-    config = merge_config(DEFAULT_CONFIG, override)
+        raise UserError(f"{path.name} is not valid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise UserError(f"{path.name} must contain a JSON object.")
+    return data
+
+
+def read_local_config(path: Path | None) -> dict:
+    local = local_config_path(path)
+    return read_json_object(local) if local.exists() else {}
+
+
+def apply_fixed_values(config: dict) -> None:
+    for entry in config["template_fields"]:
+        if "value" in entry and entry["label"] in config["fixed_values"]:
+            entry["value"] = config["fixed_values"][entry["label"]]
+
+
+def load_config(path: Path | None = None) -> dict:
+    """config.json (shipped defaults) with config.local.json (your saved answers) on top."""
+    config_path = path or DEFAULT_CONFIG_PATH
+    if config_path.exists():
+        config = merge_config(DEFAULT_CONFIG, read_json_object(config_path), config_path.name)
+    elif path is not None:
+        raise UserError(f"Config file not found: {config_path}")
+    else:
+        config = copy.deepcopy(DEFAULT_CONFIG)
+    local = read_local_config(path)
+    if local:
+        config = merge_config(config, local, local_config_path(path).name)
     validate_config(config)
+    apply_fixed_values(config)
     return config
+
+
+def save_local_config(path: Path | None, changes: dict) -> Path:
+    """Merge `changes` into config.local.json, leaving everything else in it alone."""
+    target = local_config_path(path)
+    data = read_json_object(target) if target.exists() else {}
+
+    def merge(into: dict, new: dict) -> None:
+        for key, value in new.items():
+            if isinstance(value, dict) and isinstance(into.get(key), dict):
+                merge(into[key], value)
+            else:
+                into[key] = copy.deepcopy(value)
+
+    merge(data, changes)
+    target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return target
 
 
 def expand(text: str, config: dict) -> str:
@@ -274,7 +337,13 @@ def needed_headers(config: dict) -> list[str]:
 
 
 def read_students(workbook_path: Path, sheet_name: str | None, config: dict) -> tuple[list[Student], list[str]]:
-    workbook = load_workbook(workbook_path, data_only=True, read_only=True)
+    try:
+        workbook = load_workbook(workbook_path, data_only=True, read_only=True)
+    except Exception as error:
+        raise UserError(
+            f"Could not open '{workbook_path.name}' as an Excel workbook ({type(error).__name__}). "
+            "Check that it is an .xlsx file (not an old .xls or Excel's temporary '~$' file)."
+        ) from error
     notes: list[str] = []
     try:
         if sheet_name:
@@ -948,9 +1017,33 @@ def field_value(entry: dict, student: Student, config: dict) -> str:
     return expand(entry["value"], config).strip()
 
 
+def open_template(path: Path):
+    try:
+        return Document(path)
+    except Exception as error:
+        raise UserError(
+            f"Could not open '{path.name}' as a Word (.docx) document ({type(error).__name__}). "
+            "Check that it is a .docx file (not an old .doc or Word's temporary '~$' file)."
+        ) from error
+
+
+def read_template_full_marks(document, label: str | None) -> int | None:
+    """The number after the template's "Full Marks:" text, or None if it is not there."""
+    if not label:
+        return None
+    try:
+        paragraph = find_label_paragraph(document, label, required=False)
+    except UserError:
+        return None
+    if paragraph is None:
+        return None
+    found = re.search(r"\d+", paragraph_text(paragraph).split(label, 1)[1])
+    return int(found.group()) if found else None
+
+
 def analyse_template(template_path: Path, config: dict) -> tuple[MarksTable | None, list[str]]:
     """Check that every declared label exists; return the marks table and warnings."""
-    document = Document(template_path)
+    document = open_template(template_path)
     warnings: list[str] = []
     for entry in config["template_fields"]:
         required = "column" in entry or bool(entry["value"].strip())
@@ -961,15 +1054,11 @@ def analyse_template(template_path: Path, config: dict) -> tuple[MarksTable | No
         find_label_paragraph(document, config["signature"]["label"])
 
     label = config.get("full_marks_label")
-    if label:
-        paragraph = find_label_paragraph(document, label, required=False)
-        if paragraph is not None:
-            found = re.search(r"\d+", paragraph_text(paragraph).split(label, 1)[1])
-            if found and int(found.group()) != config["full_marks"]:
-                warnings.append(
-                    f"The template says '{label} {found.group()}' but config.full_marks is "
-                    f"{config['full_marks']}."
-                )
+    stated = read_template_full_marks(document, label)
+    if stated is not None and stated != config["full_marks"]:
+        warnings.append(
+            f"The template says '{label} {stated}' but full marks is set to {config['full_marks']}."
+        )
 
     marks = None
     if config["marks_table"] is not None:
@@ -1183,6 +1272,129 @@ def write_report(path: Path, jobs: list[Job], marks: MarksTable | None, failures
 
 
 # --------------------------------------------------------------------------
+# Settings screen: per-exam values asked for at the start of a run
+# --------------------------------------------------------------------------
+
+def parse_exam_date(text: str) -> str | None:
+    """DD-MM-YYYY text normalised (2-9-2026 -> 02-09-2026), or None if it is not a date."""
+    try:
+        return datetime.strptime(text.strip(), "%d-%m-%Y").strftime("%d-%m-%Y")
+    except ValueError:
+        return None
+
+
+def fixed_value_entries(config: dict) -> list[dict]:
+    """Fixed-value labels that are typed by hand (not derived, like {exam_date})."""
+    return [e for e in config["template_fields"] if "value" in e and "{" not in e["value"]]
+
+
+def set_fixed_value(config: dict, label: str, value: str) -> None:
+    config["fixed_values"][label] = value
+    apply_fixed_values(config)
+
+
+def settings_rows(config: dict) -> list[tuple[str, str, str]]:
+    """(key, title, shown value) for each line of the settings screen."""
+    rows = [
+        ("exam_date", "Exam date", config["exam_date"] or "(blank)"),
+        ("full_marks", "Full marks", str(config["full_marks"])),
+    ]
+    for entry in fixed_value_entries(config):
+        rows.append((f"fixed:{entry['label']}", entry["label"].rstrip(": "), entry["value"] or "(blank)"))
+    mode = config["font_mode"]
+    rows.append(("font_mode", "Font mode",
+                 mode if mode == "template" else f"custom ({config['custom_font']['name']})"))
+    return rows
+
+
+def review_settings(config: dict, changes: dict, *, template_full_marks: int | None = None,
+                    full_marks_from_template: bool = False,
+                    input_fn: Callable[[str], str] = input) -> None:
+    """Show the per-exam settings and let the user change them.
+
+    `config` is updated as the user answers; every change is also recorded in
+    `changes` (in config.local.json's shape) so the caller can offer to save it.
+    """
+    def ask(prompt: str) -> str:
+        return input_fn(prompt).strip()
+
+    while True:
+        rows = settings_rows(config)
+        info("\nSettings for this run")
+        for number, (_, title, shown) in enumerate(rows, start=1):
+            info(f"  {number}. {title:<26}{shown}")
+        if template_full_marks is not None:
+            if full_marks_from_template:
+                info(f"     (Full marks {config['full_marks']} was read from the template.)")
+            elif template_full_marks != config["full_marks"]:
+                info(f"     (Note: the template itself says Full Marks: {template_full_marks}.)")
+
+        reply = ask("\nPress Enter to continue, or type a number to change it: ")
+        if not reply:
+            return
+        if not (reply.isdigit() and 1 <= int(reply) <= len(rows)):
+            info("  Please type one of the numbers shown, or just press Enter.")
+            continue
+        key, title, _ = rows[int(reply) - 1]
+
+        if key == "exam_date":
+            current = config["exam_date"] or "blank"
+            answer = ask(f"Exam date as DD-MM-YYYY [{current}] (Enter keeps, - clears): ")
+            if not answer:
+                continue
+            if answer == "-":
+                new = ""
+            else:
+                new = parse_exam_date(answer)
+                if new is None:
+                    use = ask(f"  '{answer}' does not look like DD-MM-YYYY. Use it anyway? [y/N]: ")
+                    if use.casefold() not in {"y", "yes"}:
+                        continue
+                    new = answer
+            config["exam_date"] = new
+            changes["exam_date"] = new
+
+        elif key == "full_marks":
+            answer = ask(f"Full marks [{config['full_marks']}]: ")
+            if not answer:
+                continue
+            if not answer.isdigit() or int(answer) < 1:
+                info("  Full marks must be a whole number of at least 1.")
+                continue
+            config["full_marks"] = int(answer)
+            changes["full_marks"] = int(answer)
+            full_marks_from_template = False
+
+        elif key.startswith("fixed:"):
+            label = key.split(":", 1)[1]
+            entry = next(e for e in config["template_fields"] if e["label"] == label)
+            answer = ask(f"{title} [{entry['value'] or 'blank'}] (Enter keeps, - clears): ")
+            if not answer:
+                continue
+            new = "" if answer == "-" else answer
+            set_fixed_value(config, label, new)
+            changes.setdefault("fixed_values", {})[label] = new
+
+        elif key == "font_mode":
+            answer = ask("Font: 1 = the template's own font, 2 = a custom font. Choose 1 or 2: ")
+            if answer == "1":
+                config["font_mode"] = "template"
+                changes["font_mode"] = "template"
+            elif answer == "2":
+                current = config["custom_font"]["name"]
+                name = ask(f"Font name [{current}]: ") or current
+                if not name:
+                    info("  A font name is needed for a custom font.")
+                    continue
+                config["font_mode"] = "custom"
+                config["custom_font"]["name"] = name
+                changes["font_mode"] = "custom"
+                changes.setdefault("custom_font", {})["name"] = name
+            elif answer:
+                info("  Please type 1 or 2.")
+
+
+# --------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------
 
@@ -1216,6 +1428,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Create DOCX files only, no PDFs")
     parser.add_argument("--check", action="store_true",
                         help="Validate everything and report; write no files")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="Do not show the settings screen; use config.json and config.local.json as they are")
     parser.add_argument("--ask-sections", action="store_true",
                         help="Ask about the sections again even if rules are saved")
     parser.add_argument("--answer", help="Questions to answer per section, e.g. 5,4 "
@@ -1231,21 +1445,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def apply_overrides(config: dict, args: argparse.Namespace) -> None:
+def apply_overrides(config: dict, args: argparse.Namespace) -> set[str]:
+    """Apply command-line overrides; return the setting names they set."""
+    given: set[str] = set()
     if args.exam_date is not None:
         config["exam_date"] = args.exam_date
+        given.add("exam_date")
     if args.full_marks is not None:
         config["full_marks"] = args.full_marks
+        given.add("full_marks")
     if args.font_mode:
         config["font_mode"] = args.font_mode
+        given.add("font_mode")
     if args.custom_font:
         config["custom_font"]["name"] = args.custom_font
         config["font_mode"] = args.font_mode or "custom"
+        given.update({"font_mode", "custom_font"})
     if args.duplicates:
         config["duplicates"] = args.duplicates
+        given.add("duplicates")
     if args.existing_files:
         config["existing_files"] = args.existing_files
+        given.add("existing_files")
     validate_config(config)
+    return given
 
 
 def report_problems(title: str, items: list[str]) -> None:
@@ -1256,7 +1479,7 @@ def report_problems(title: str, items: list[str]) -> None:
 
 def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int:
     config = load_config(args.config)
-    apply_overrides(config, args)
+    explicit = set(read_local_config(args.config)) | apply_overrides(config, args)
 
     workbook_path = args.workbook or choose_input_file("student data workbook", (".xlsx", ".xlsm"))
     template_path = args.template or choose_input_file("top sheet template", (".docx",))
@@ -1264,10 +1487,36 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
         if not path.is_file():
             raise UserError(f"The {label} file was not found: {path}")
 
+    # Full marks: offer the number the template itself states, unless the user has set one.
+    stated = read_template_full_marks(open_template(template_path), config.get("full_marks_label"))
+    from_template = False
+    if stated is not None and "full_marks" not in explicit and stated != config["full_marks"]:
+        config["full_marks"] = stated
+        from_template = True
+
+    if not args.no_prompt and not args.check:
+        changes: dict = {}
+        try:
+            review_settings(config, changes, template_full_marks=stated,
+                            full_marks_from_template=from_template, input_fn=input_fn)
+            if changes:
+                local_name = local_config_path(args.config).name
+                reply = input_fn(f"\nSave these changes as your defaults in {local_name}? [Y/n]: ")
+                if reply.strip().casefold() not in {"n", "no"}:
+                    info(f"Saved to {save_local_config(args.config, changes)}.")
+        except EOFError:
+            info("\n(No one is answering the questions; continuing with the settings shown.)")
+        validate_config(config)
+
     students, notes = read_students(workbook_path, args.sheet, config)
     info(f"Workbook: {workbook_path.name} - {len(students)} student row(s) read.")
     students, duplicate_notes, conflicts = resolve_duplicates(students, config["duplicates"])
     warnings = notes + duplicate_notes
+    if not config["exam_date"].strip():
+        warnings.append(
+            "The exam date is empty, so 'Date of Examination' and the date under the signature "
+            "are left blank. Set it on the settings screen or with --exam-date."
+        )
     errors = list(conflicts)
     data_errors, data_warnings = validate_students(students, config)
     errors += data_errors
@@ -1320,7 +1569,7 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
 
     absent = sum(1 for j in jobs if j.student.total is None)
     info(f"\nReady: {len(jobs)} sheet(s), {absent} absent. Font mode: {config['font_mode']}. "
-         f"Exam date: {config['exam_date']}.")
+         f"Exam date: {config['exam_date'] or '(blank)'}.")
     if args.check:
         info("Check finished; no files were written.")
         return 0
