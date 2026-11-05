@@ -1,5 +1,7 @@
 # CA1 Top Sheets Automation
 
+[![tests](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml/badge.svg)](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml)
+
 Generate one completed Word top sheet and PDF per student from any Excel workbook and compatible DOCX template.
 
 The workbook and template are supplied at runtime, so their filenames and locations are entirely up to the user. Original input files are never changed.
@@ -37,6 +39,8 @@ After placing or cloning this project on a computer, open PowerShell in the proj
 py .\generate_top_sheets.py
 ```
 
+On Windows you can instead double-click `run.bat`. It finds Python, installs the required packages the first time, starts the program and keeps the window open at the end so you can read the result.
+
 Two standard file pickers will open in sequence:
 
 1. Choose the student Excel workbook (`.xlsx`).
@@ -47,6 +51,16 @@ Next comes a short settings screen (see [Settings screen](#settings-screen)). Pr
 The first time a template is used, the program shows the question sections it found and asks how many questions are to be answered in each (see [Sections](#sections-answer-any-n)). The answers are saved, so later runs with the same template do not ask again.
 
 The generated files are written to `output\docx` and `output\pdf`. Input filenames do not need to match any predefined names.
+
+### Try it with the examples
+
+The `examples` folder has a sample workbook (fake students) and the template it was made for:
+
+```powershell
+py .\generate_top_sheets.py --workbook ".\examples\Template_student_data.xlsx" --template ".\examples\ME_CA1_2026.docx"
+```
+
+Enter an exam date on the settings screen, accept the detected sections, and answer `5` and `4` for the number of questions in each. The sample mobile numbers have 9 digits, so you will see one harmless warning about that. Everything is written to `output`.
 
 ## Settings screen
 
@@ -124,7 +138,7 @@ The selected worksheet must have the headers declared in `config.json` in its fi
 | `Mobile Number` | Mobile Number field |
 | `Marks Obtained` | Total score and question-wise allocation |
 
-`Marks Obtained` must be a whole number from 0 to `full_marks`, or `Ab`. [Example template](https://docs.google.com/spreadsheets/d/1g16tx5055atuTEP42zXqHH92BK4apdje/edit?usp=sharing&ouid=105329508417402305211&rtpof=true&sd=true)
+`Marks Obtained` must be a whole number from 0 to `full_marks`, or `Ab`. [Example workbook](examples/Template_student_data.xlsx)
 
 **Roll number as the primary key.** Roll numbers are normalised first (`34900725001`, `34900725001.0` and ` 34900725001 ` are the same student). If a roll number appears more than once:
 
@@ -137,7 +151,7 @@ Rows with a blank name or roll number are skipped with a note. Blank values in a
 
 Every label in `template_fields` must appear in the template exactly once, plus the signature label (`Signature of the student with date` by default). The typed signature and date are inserted above the signature label.
 
-The question-wise marks need a table whose header row contains `Q. No.`, `Marks Allotted` and `Marks Awarded` (set under `marks_table`). Column order and any other columns do not matter, and any number of question rows is fine. Rows whose `Marks Allotted` cell is blank can never receive marks. [Example template](https://docs.google.com/document/d/1MEd09kKXdDmPIVZjeK-MCoThG1fBDorq/edit?usp=sharing&ouid=105329508417402305211&rtpof=true&sd=true)
+The question-wise marks need a table whose header row contains `Q. No.`, `Marks Allotted` and `Marks Awarded` (set under `marks_table`). Column order and any other columns do not matter, and any number of question rows is fine. Rows whose `Marks Allotted` cell is blank can never receive marks. [Example template](examples/ME_CA1_2026.docx)
 
 ## Sections ("answer any N")
 
@@ -234,6 +248,51 @@ py -m unittest -v
 ```
 
 The tests build their own small templates and workbooks, so they need neither your real template nor any student data.
+
+## Troubleshooting
+
+Problems with the workbook, config or template are all listed together, before any file is generated.
+
+| What you see | What it means and what to do |
+| --- | --- |
+| `The workbook has no column with the header(s) declared in the config` | A header differs from the config. Headers must match exactly, including spaces and capitals. Fix the workbook header, or the `columns` / `template_fields` entry in `config.json`. The message lists the headers it did find. |
+| `The template has no text '...'` | A label in `template_fields` is not in the template as typed. Copy it from the template, or correct it in the config. |
+| `The template contains '...' in N places` | A label must appear exactly once. Make the text unique in the template. |
+| `The template has no table whose header row contains ...` | The marks table headers differ from `marks_table` in the config. |
+| `Roll ... appears in rows ... with different details` | The same roll number has different names, mobile numbers or marks. Fix the workbook, or set `duplicates` to `keep-first` or `keep-last`. |
+| `... marks cannot be split ... (possible totals: a to b)` | That student's total is outside what the section rules allow. Correct the total, change the answers per section with `--ask-sections`, or set `unreachable_marks` to `skip`. |
+| `The section rules for this template are not saved yet and no one is there to answer` | Run once in a normal terminal to answer the section questions, or pass `--answer 5,4`. |
+| `No PDF engine is available` | Install Microsoft Word with `pywin32`, or LibreOffice, or use `--keep-docx-only`. Use `--soffice PATH` if LibreOffice is installed but not found. |
+| `Could not open ... as a Word (.docx) document` or `... as an Excel workbook` | The file is not a `.docx` / `.xlsx`, for example an old `.doc` / `.xls`, or Office's temporary file that starts with `~$`. |
+| `FAILED roll ...: PermissionError` | An output file is open in Word, Excel or a PDF viewer. Close it and run again. |
+| `'Mobile Number' has 9 digits instead of 10` | Excel drops a leading zero from numbers. Format the column as Text. This is only a warning. |
+| The signature looks like an ordinary font | The five handwriting fonts are not installed on that computer, so Word substituted another. |
+| The settings screen is in your way | Use `--no-prompt`. |
+| You want to start over | Delete `config.local.json` and `section_rules.json`. |
+
+## Known limitations
+
+- Marks are whole numbers. Half marks are not supported, and `17.5` is reported as an error.
+- In every section exactly N questions are answered, each with at least 1 mark. A student's total therefore cannot be below the sum of the N values (9 with answers of 5 and 4), so a total of 0 cannot be split. See `unreachable_marks`.
+- A section is a run of consecutive question rows.
+- The template needs one marks table, found by its header texts. Question labels must be unique.
+- Labels are found in the document body and in table cells, not in headers, footers or text boxes. A label must be plain text, not part of a hyperlink or a content control. The value replaces everything after the label in its paragraph.
+- An output file that is open in another program cannot be overwritten.
+- The Word PDF export cannot be exercised by the automated tests, which run on Linux and Windows without Word. PDFs made by LibreOffice can look slightly different from Word's.
+- The five signature fonts are Windows fonts.
+
+## Intended use
+
+This tool prepares CA1 top sheets from a workbook of marks and a template that your department already uses. Please note what it generates:
+
+- **The question-wise marks are generated.** They are spread randomly within each question's allotted marks so that they add up to the total in the workbook. They are not an examiner's own question-by-question assessment.
+- **The typed signature is generated.** It is the student's name in a handwriting-style font, not a handwritten signature. Set `"signature": {"enabled": false}` in the config to leave it out.
+
+Use the tool only where your institution permits sheets to be prepared this way, and do not present generated content as an examiner's or a student's original record. The software is provided as is, without warranty (see [LICENSE](LICENSE)).
+
+## Version
+
+This is version 2.0.0. See [CHANGELOG.md](CHANGELOG.md) for what changed, or run `py .\generate_top_sheets.py --version`.
 
 ## Notes
 
