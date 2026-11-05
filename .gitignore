@@ -17,3 +17,8 @@ venv/
 # Per-user settings saved by the program (not for the repository)
 config.local.json
 section_rules.json
+
+# ...but keep the example files, which contain only fake data
+!examples/
+!examples/*.docx
+!examples/*.xlsx

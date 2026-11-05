@@ -42,6 +42,8 @@ from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
 
+__version__ = "2.0.0"
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = HERE / "config.json"
 RULES_FILENAME = "section_rules.json"
@@ -1417,6 +1419,7 @@ def choose_input_file(label: str, suffixes: tuple[str, ...]) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create one completed CA1 top sheet per student.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--workbook", type=Path, help="Excel workbook with the student data")
     parser.add_argument("--template", type=Path, help="Word top-sheet template")
     parser.add_argument("--sheet", help="Worksheet name (default: the active sheet)")

@@ -1,0 +1,14 @@
+# Store text files with LF in the repository and let each computer use its own
+# line endings in the working copy. This stops files showing up as "modified"
+# when the repository is used on both Windows and Mac/Linux.
+* text=auto
+
+# Windows batch files must keep CRLF line endings to run reliably.
+*.bat text eol=crlf
+
+# Never touch binary files.
+*.docx binary
+*.xlsx binary
+*.pdf binary
+*.png binary
+*.jpg binary

@@ -640,6 +640,47 @@ class SettingsScreen(unittest.TestCase):
             quiet(g.review_settings, config(), {}, input_fn=feeder())
 
 
+class Release(TempCase):
+    def test_version_flag(self):
+        with redirect_stdout(io.StringIO()) as buffer:
+            with self.assertRaises(SystemExit) as caught:
+                g.parse_args(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn(g.__version__, buffer.getvalue())
+
+    def test_changelog_leads_with_the_current_version(self):
+        changelog = g.HERE / "CHANGELOG.md"
+        if not changelog.exists():
+            self.skipTest("no CHANGELOG.md beside the script")
+        headings = [l for l in changelog.read_text(encoding="utf-8").splitlines() if l.startswith("## ")]
+        self.assertTrue(headings[0].startswith(f"## {g.__version__}"), headings[0])
+
+    def test_gitignore_keeps_data_out_but_lets_the_examples_in(self):
+        ignore = g.HERE / ".gitignore"
+        if not ignore.exists():
+            self.skipTest("no .gitignore beside the script")
+        text = ignore.read_text()
+        for pattern in ("*.xlsx", "*.docx", "output/", "config.local.json", "section_rules.json",
+                        "!examples/*.docx", "!examples/*.xlsx"):
+            self.assertIn(pattern, text)
+        # the exceptions must come after the broad patterns, or they do nothing
+        self.assertGreater(text.index("!examples/*.docx"), text.index("*.docx"))
+
+    def test_the_shipped_examples_work(self):
+        examples = g.HERE / "examples"
+        workbook = examples / "Template_student_data.xlsx"
+        template = examples / "ME_CA1_2026.docx"
+        if not (workbook.exists() and template.exists()):
+            self.skipTest("no examples folder beside the script")
+        (self.dir / "config.json").write_text((g.HERE / "config.json").read_text(encoding="utf-8-sig"))
+        argv = ["--workbook", str(workbook), "--template", str(template), "--config",
+                str(self.dir / "config.json"), "--output", str(self.dir / "out"), "--answer", "5,4",
+                "--exam-date", "01-01-2027", "--no-prompt", "--keep-docx-only", "--workers", "1"]
+        code, text = quiet(g.run, g.parse_args(argv))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(len(list((self.dir / "out" / "docx").glob("*.docx"))), 16)
+
+
 class WrongFiles(TempCase):
     def test_a_wrong_template_file_gives_a_readable_error(self):
         bad = self.dir / "t.docx"
