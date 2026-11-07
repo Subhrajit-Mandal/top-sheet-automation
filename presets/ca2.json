@@ -1,0 +1,13 @@
+{
+  "template_fields": [
+    { "label": "Name of the Student:", "column": "Name", "where": "next-cell" },
+    { "label": "Roll Number:", "column": "UNI Roll number", "where": "next-cell" },
+    { "label": "Mobile Number:", "column": "Mobile Number", "where": "next-cell" },
+    { "label": "Marks Obtained:", "column": "Marks Obtained", "where": "next-cell" },
+    { "label": "Date of Examination:", "value": "{exam_date}", "where": "next-cell" },
+    { "label": "Paper (course) Code:", "value": "", "where": "next-cell" },
+    { "label": "Subject Teacher:", "value": "", "where": "next-cell" },
+    { "label": "UPID:", "value": "", "where": "next-cell" }
+  ],
+  "full_marks_label": null
+}

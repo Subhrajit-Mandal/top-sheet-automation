@@ -3,6 +3,30 @@
 All notable changes to this project are listed here, newest first.
 The version number is also printed by `py .\generate_top_sheets.py --version`.
 
+## 2.2.0 - 2026-11-07
+
+### Added
+- Optional official seal, kept as a separate image file and stamped on every sheet the program creates, in both modes. An interactive run asks "Stamp the official seal on all N sheet(s)?" just before the sheets are made and opens a file picker for the image; `--seal PATH` does the same without asking.
+- The seal is placed at the very end of the document, towards the bottom right, a small distance below the last line, without changing the page layout. `seal` settings in `config.json` set its width, gap, alignment and offset.
+- A sheet that already has a picture named like a seal is not stamped a second time and is listed. The summary reports how many sheets were stamped, and `run_report.csv` has a new `Seal` column.
+- `seal/` and `seals/` are ignored by git.
+
+### Changed
+- The README's intended-use note now covers the seal.
+
+## 2.1.0 - 2026-11-07
+
+### Added
+- Complete sheets that students filled in themselves: `--submissions FOLDER`. Each sheet is matched to the workbook by the roll number written in it, the marks and question-wise marks are added, and the student's own text, signature and pictures are left untouched. Differences from the workbook are listed, blank fields are filled, and students with no sheet are listed.
+- A sheet that cannot be used (not a readable Word file, a picture missing inside it, a different layout, an unknown or repeated roll number) is skipped and listed by name; it never stops the run.
+- `where` setting for each field in `template_fields`: `"after-label"` (default) or `"next-cell"`, for sheets that keep the value in the cell to the right of the label. Works when generating sheets as well.
+- `presets/ca2.json` for the CA2 sheet, and a question at the start of an interactive run: generate new sheets, or complete submitted ones.
+- `submissions/` and `*.local.json` are ignored by git.
+
+### Changed
+- A new Marks Awarded entry takes the alignment of the Marks Allotted column when the cell has none of its own.
+- The README's intended-use note now distinguishes generated signatures from sheets the students signed themselves.
+
 ## 2.0.0 - 2026-11-05
 
 ### Added

@@ -22,3 +22,11 @@ section_rules.json
 !examples/
 !examples/*.docx
 !examples/*.xlsx
+
+# Sheets filled in by students (names, phone numbers, signatures) and per-config saved settings
+submissions/
+*.local.json
+
+# The official seal image must never be committed
+seal/
+seals/

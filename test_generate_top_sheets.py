@@ -6,6 +6,7 @@ neither your real template nor any student data.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import io
@@ -14,9 +15,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from docx import Document
-from docx.shared import Pt
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
 from openpyxl import Workbook
 
 import generate_top_sheets as g
@@ -576,6 +579,73 @@ class EndToEnd(TempCase):
         self.assertNotIn("was read from the template", text)
         self.assertIn("the template itself says Full Marks: 30", text)
 
+    # ---- official seal, generate mode ------------------------------------
+
+    def seal_file(self) -> Path:
+        path = self.dir / "seal.png"
+        path.write_bytes(tiny_png())
+        return path
+
+    def test_the_seal_is_stamped_on_every_sheet(self):
+        code, text = self.go("--seal", str(self.seal_file()))
+        self.assertEqual(code, 0, text)
+        sheets = sorted((self.out / "docx").glob("*.docx"))
+        self.assertEqual(len(sheets), 3)
+        for sheet in sheets:
+            self.assertEqual(len(seal_anchors(Document(sheet))), 1, sheet.name)
+        self.assertIn("Seal: stamped on 3 of 3 sheet(s) (seal.png)", text)
+        self.assertEqual({r["Seal"] for r in self.report() if r["Status"] == "written"}, {"stamped"})
+
+    def test_without_a_seal_nothing_is_stamped_and_nothing_is_said(self):
+        code, text = self.go()
+        for sheet in (self.out / "docx").glob("*.docx"):
+            self.assertEqual(seal_anchors(Document(sheet)), [])
+        self.assertNotIn("Seal:", text)
+        self.assertEqual({r["Seal"] for r in self.report()}, {""})
+
+    def test_answering_yes_then_choosing_a_file_stamps_every_sheet(self):
+        with mock.patch.object(g, "choose_input_file", return_value=self.seal_file()):
+            code, text = self.go(screen=True, answers=("", "", "5", "4", "", "y"))
+        self.assertEqual(code, 0, text)
+        for sheet in (self.out / "docx").glob("*.docx"):
+            self.assertEqual(len(seal_anchors(Document(sheet))), 1)
+
+    def test_answering_no_stamps_nothing(self):
+        with mock.patch.object(g, "choose_input_file") as picker:
+            code, _ = self.go(screen=True, answers=("", "", "5", "4", "", "n"))
+        picker.assert_not_called()
+        for sheet in (self.out / "docx").glob("*.docx"):
+            self.assertEqual(seal_anchors(Document(sheet)), [])
+
+    def test_a_bad_seal_file_stops_before_anything_is_written(self):
+        bad = self.dir / "seal.png"
+        bad.write_text("not a picture")
+        with self.assertRaises(g.UserError) as caught:
+            self.go("--seal", str(bad))
+        self.assertIn("could not be read as a picture", str(caught.exception))
+        self.assertFalse((self.out / "docx").exists())
+
+    def test_check_mode_looks_at_the_seal_but_writes_nothing(self):
+        code, text = self.go("--check", "--seal", str(self.seal_file()))
+        self.assertEqual(code, 0, text)
+        self.assertIn("seal.png can be used", text)
+        self.assertFalse(self.out.exists())
+
+    def test_a_template_that_already_has_a_seal_is_not_stamped_twice(self):
+        template = Document(self.template)
+        template.add_picture(io.BytesIO(tiny_png()))
+        next(template.element.body.iter(qn("wp:docPr"))).set("name", "College Seal")
+        template.save(self.template)
+        code, text = self.go("--seal", str(self.seal_file()))
+        self.assertEqual(code, 0, text)
+        self.assertIn("already had a seal", text)
+        for sheet in (self.out / "docx").glob("*.docx"):
+            self.assertEqual(seal_anchors(Document(sheet)), [])
+
+    def report(self):
+        with (self.out / g.REPORT_FILENAME).open(encoding="utf-8-sig", newline="") as handle:
+            return list(g.csv.DictReader(handle))
+
     def test_shipped_config_matches_the_code_defaults(self):
         shipped = g.json.loads((g.HERE / "config.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(shipped, g.DEFAULT_CONFIG)
@@ -640,6 +710,658 @@ class SettingsScreen(unittest.TestCase):
             quiet(g.review_settings, config(), {}, input_fn=feeder())
 
 
+# --------------------------------------------------------------------------
+# Sheets that students have filled in (value in the cell next to the label)
+# --------------------------------------------------------------------------
+
+CA2_QUESTIONS = [("1.i)", "1"), ("1.ii)", "1"), ("1.iii)", "1"), ("1.iv)", "1"), ("1v)", "1"),
+                 ("2", "5"), ("3", "5"), ("4", "5"), ("5", "5")]
+
+
+def tiny_png() -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
+
+
+def make_ca2(path: Path, roll: str, name: str, mobile: str = "9876543210", *, teacher: str = "Dr X",
+             marks: str = "", picture: bool = True, questions=CA2_QUESTIONS) -> Path:
+    """A student-filled sheet: every label has its value in the cell to its right."""
+    document = Document()
+    rows = [("Name of the Student:", name, "Roll Number:", roll),
+            ("UPID:", "", "Date of Examination:", ""),
+            ("Paper (course) Code:", "", "Mobile Number:", mobile),
+            ("Subject Teacher:", teacher, "Full Marks:", "25"),
+            ("Marks Obtained:", marks, "", "")]
+    table = document.add_table(rows=len(rows), cols=4)
+    for r, values in enumerate(rows):
+        for c, text in enumerate(values):
+            if text:
+                run = table.cell(r, c).paragraphs[0].add_run(text)
+                run.bold = c % 2 == 0
+                run.font.name = "Trebuchet MS"
+    marks_table = document.add_table(rows=1 + len(questions), cols=4)
+    for c, header in enumerate(("Q. No.", "Marks Allotted", "Marks Awarded", "Course Outcome")):
+        marks_table.cell(0, c).text = header
+    for r, (label, allotted) in enumerate(questions, start=1):
+        marks_table.cell(r, 0).text = label
+        marks_table.cell(r, 1).text = allotted
+        marks_table.cell(r, 1).paragraphs[0].alignment = 1  # centred, like the real sheet
+    if picture:
+        document.add_picture(io.BytesIO(tiny_png()))
+    document.save(path)
+    return path
+
+
+def ca2_value(path: Path, label: str) -> str:
+    document = Document(path)
+    return g.read_field(g.find_label_paragraph(document, label), label, "next-cell")
+
+
+def awarded_marks(path: Path) -> dict[str, str]:
+    table, marks = g.find_marks_table(Document(path), config())
+    return {q.label: table.rows[q.table_row].cells[marks.awarded_col].text
+            for q in marks.questions if table.rows[q.table_row].cells[marks.awarded_col].text}
+
+
+def ca2_config_text() -> str:
+    return (g.HERE / "presets" / "ca2.json").read_text(encoding="utf-8-sig")
+
+
+STUDENTS = [["Tania Dandapat", 34900725002, "9434310339", 23],
+            ["Sarat Roy", "LME2026410", "9434310338", 17],
+            ["Mita Das", 34900725003, "9434310340", "Ab"],
+            ["Rohan Sen", 34900725004, "9434310341", 25]]
+
+
+class Submissions(TempCase):
+    def setUp(self):
+        super().setUp()
+        if not (g.HERE / "presets" / "ca2.json").exists():
+            self.skipTest("no presets/ca2.json beside the script")
+        self.subs = self.dir / "subs"
+        self.subs.mkdir()
+        self.workbook = make_workbook(self.dir / "w.xlsx", STUDENTS)
+        self.config = self.dir / "ca2.json"
+        self.config.write_text(ca2_config_text())
+        self.out = self.dir / "out"
+
+    def sheet(self, name, roll, student, **kwargs):
+        return make_ca2(self.subs / name, roll, student, **kwargs)
+
+    def go(self, *extra, answers=(), answer="5,4"):
+        argv = ["--workbook", str(self.workbook), "--submissions", str(self.subs), "--config",
+                str(self.config), "--output", str(self.out), "--keep-docx-only", "--no-prompt", *extra]
+        if answer:
+            argv += ["--answer", answer]
+
+        def like_main(args, input_fn):  # what main() does with a problem the user can fix
+            try:
+                return g.run(args, input_fn)
+            except g.UserError as error:
+                print(f"\nERROR: {error}")
+                return 1
+        return quiet(like_main, g.parse_args(argv), feeder(*answers))
+
+    def report(self):
+        with (self.out / g.REPORT_FILENAME).open(encoding="utf-8-sig", newline="") as handle:
+            return list(g.csv.DictReader(handle))
+
+    # ---- official seal, submissions mode ---------------------------------
+
+    def seal_file(self) -> Path:
+        path = self.dir / "seal.png"
+        path.write_bytes(tiny_png() + b"\0")   # not byte-identical to the students' own picture
+        return path
+
+    def test_the_seal_goes_on_completed_sheets_only(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        self.sheet("stranger.docx", "99999999999", "STRANGER")
+        code, text = self.go("--seal", str(self.seal_file()))
+        self.assertEqual(code, 1)    # the stranger's sheet is skipped
+        done = sorted((self.out / "docx").glob("*.docx"))
+        self.assertEqual(len(done), 1)
+        self.assertEqual(len(seal_anchors(Document(done[0]))), 1)
+        self.assertIn("Seal: stamped on 1 of 1 sheet(s) (seal.png)", text)
+        seals = {r["Submitted file"]: r["Seal"] for r in self.report()}
+        self.assertEqual(seals["t.docx"], "stamped")
+        self.assertEqual(seals["stranger.docx"], "")
+
+    def test_the_students_own_pictures_survive_next_to_the_seal(self):
+        source = self.sheet("t.docx", "34900725002", "TANIA")
+        self.go("--seal", str(self.seal_file()))
+        done = Document(self.out / "docx" / "34900725002_Tania Dandapat.docx")
+        blobs = [part.blob for part in done.part.package.iter_parts() if part.partname.startswith("/word/media/")]
+        self.assertEqual(len(blobs), 2)                       # the student's picture and the seal
+        import zipfile
+        original = [zipfile.ZipFile(source).read(n) for n in zipfile.ZipFile(source).namelist()
+                    if n.startswith("word/media/")]
+        self.assertTrue(all(blob in blobs for blob in original))
+
+    def test_a_submitted_sheet_that_already_has_a_seal_is_not_stamped_again(self):
+        path = self.sheet("t.docx", "34900725002", "TANIA")
+        document = Document(path)
+        next(document.element.body.iter(qn("wp:docPr"))).set("name", "College Seal")
+        document.save(path)
+        code, text = self.go("--seal", str(self.seal_file()))
+        self.assertEqual(code, 0, text)
+        self.assertIn("already had a seal", text)
+        done = Document(self.out / "docx" / "34900725002_Tania Dandapat.docx")
+        self.assertEqual(seal_anchors(done), [])
+
+    def test_answering_yes_stamps_the_completed_sheets(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        argv = ["--workbook", str(self.workbook), "--submissions", str(self.subs), "--config",
+                str(self.config), "--output", str(self.out), "--keep-docx-only", "--answer", "5,4"]
+        with mock.patch.object(g, "choose_input_file", return_value=self.seal_file()):
+            code, text = quiet(g.run, g.parse_args(argv + ["--exam-date", "01-01-2027"]),
+                               feeder("", "y"))      # Enter on the settings screen, then yes to the seal
+        self.assertEqual(code, 0, text)
+        done = Document(self.out / "docx" / "34900725002_Tania Dandapat.docx")
+        self.assertEqual(len(seal_anchors(done)), 1)
+
+    def test_check_mode_looks_at_the_seal(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go("--check", "--seal", str(self.seal_file()))
+        self.assertEqual(code, 0, text)
+        self.assertIn("seal.png can be used", text)
+        self.assertFalse(self.out.exists())
+
+    def test_check_mode_stops_on_an_unusable_seal(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        bad = self.dir / "bad.png"
+        bad.write_text("x")
+        code, text = self.go("--check", "--seal", str(bad))
+        self.assertEqual(code, 1)
+        self.assertIn("could not be read as a picture", text)
+
+    def test_the_preset_is_a_valid_config(self):
+        cfg = g.load_config(self.config)
+        self.assertTrue(all(e.get("where") == "next-cell" for e in cfg["template_fields"]))
+
+    def test_a_sheet_is_completed_and_nothing_else_changes(self):
+        source = self.sheet("tania.docx", "34900725002", "TANIA DANDAPAT")
+        code, text = self.go()
+        self.assertEqual(code, 0, text)
+        done = self.out / "docx" / "34900725002_Tania Dandapat.docx"  # file name from the workbook
+        self.assertEqual(ca2_value(done, "Marks Obtained:"), "23")
+        self.assertEqual(ca2_value(done, "Name of the Student:"), "TANIA DANDAPAT")
+        split = awarded_marks(done)
+        self.assertEqual(sum(int(v) for v in split.values()), 23)
+        self.assertEqual(len(split), 9)
+        self.assertTrue(all(1 <= int(v) <= (1 if k.startswith("1") else 5) for k, v in split.items()))
+        # the student's picture is carried over byte for byte
+        import zipfile
+        before, after = zipfile.ZipFile(source), zipfile.ZipFile(done)
+        images = [n for n in before.namelist() if n.startswith("word/media/")]
+        self.assertTrue(images)
+        for name in images:
+            self.assertEqual(before.read(name), after.read(name))
+
+    def test_awarded_marks_follow_the_allotted_columns_alignment(self):
+        self.sheet("t.docx", "34900725002", "T")
+        self.go()
+        done = self.out / "docx" / "34900725002_Tania Dandapat.docx"
+        table, marks = g.find_marks_table(Document(done), config())
+        row = table.rows[marks.questions[0].table_row]
+        self.assertEqual(row.cells[marks.awarded_col].paragraphs[0].alignment, 1)
+
+    def test_what_the_student_wrote_is_kept_and_differences_are_listed(self):
+        self.sheet("sarat.docx", " lme 2026410 ", "SARAT ROY", mobile="9434310339")  # spaces, case
+        code, text = self.go()
+        self.assertEqual(code, 0, text)
+        done = self.out / "docx" / "LME2026410_Sarat Roy.docx"
+        self.assertEqual(ca2_value(done, "Mobile Number:"), "9434310339")      # the sheet's, not the workbook's
+        self.assertIn("9434310338", text)                                       # but the difference is shown
+        self.assertNotIn("Name of the Student:' in the sheet", text)            # name differs only by case
+        self.assertTrue(any("9434310338" in r["Notes"] for r in self.report()))
+
+    def test_blank_student_fields_are_filled_from_the_workbook(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT", mobile="")
+        code, text = self.go()
+        done = self.out / "docx" / "34900725002_Tania Dandapat.docx"
+        self.assertEqual(ca2_value(done, "Mobile Number:"), "9434310339")
+        self.assertIn("was blank", text)
+
+    def test_fixed_values_only_fill_blanks(self):
+        self.sheet("t.docx", "34900725002", "T")
+        self.go("--exam-date", "05-11-2026")
+        done = self.out / "docx" / "34900725002_Tania Dandapat.docx"
+        self.assertEqual(ca2_value(done, "Date of Examination:"), "05-11-2026")   # was blank
+        self.assertEqual(ca2_value(done, "Subject Teacher:"), "Dr X")              # student's own, untouched
+
+    def test_absent_student(self):
+        self.sheet("m.docx", "34900725003", "MITA DAS")
+        code, _ = self.go()
+        done = self.out / "docx" / "34900725003_Mita Das.docx"
+        self.assertEqual(ca2_value(done, "Marks Obtained:"), "Ab")
+        self.assertEqual(awarded_marks(done), {})
+
+    def test_the_same_roll_twice_skips_both_and_the_run_continues(self):
+        self.sheet("a.docx", "34900725002", "TANIA")
+        self.sheet("b.docx", "34900725002", "TANIA")
+        self.sheet("sarat.docx", "LME2026410", "SARAT ROY")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("submitted more than once", text)
+        self.assertEqual(sorted(p.name for p in (self.out / "docx").glob("*.docx")), ["LME2026410_Sarat Roy.docx"])
+
+    def test_a_roll_that_is_not_in_the_workbook(self):
+        self.sheet("x.docx", "99999999999", "STRANGER")
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("'99999999999' is not in the workbook", text)
+        self.assertEqual(len(list((self.out / "docx").glob("*.docx"))), 1)
+
+    def test_students_without_a_sheet_are_listed(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        _, text = self.go()
+        self.assertIn("no submitted sheet", text)
+        self.assertIn("Rohan Sen", text)
+        statuses = {r["Roll"]: r["Status"] for r in self.report()}
+        self.assertEqual(statuses["34900725004"], "NO SUBMISSION")
+        self.assertEqual(statuses["34900725002"], "completed")
+
+    def test_unreadable_files_are_reported_by_name_and_do_not_stop_the_run(self):
+        import zipfile
+        good = self.sheet("good.docx", "34900725002", "TANIA")
+        (self.subs / "truncated.docx").write_bytes(good.read_bytes()[:300])
+        with zipfile.ZipFile(good) as src, zipfile.ZipFile(self.subs / "no_image.docx", "w") as out:
+            for name in src.namelist():          # the picture part is gone but still referenced
+                if not name.startswith("word/media/"):
+                    out.writestr(name, src.read(name))
+        (self.subs / "notes.docx").write_text("this is not a Word file")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        for name in ("truncated.docx", "no_image.docx", "notes.docx"):
+            self.assertIn(name, text)
+        self.assertIn("could not be opened", text)
+        self.assertTrue((self.out / "docx" / "34900725002_Tania Dandapat.docx").exists())
+
+    def test_other_file_types_are_refused_and_lock_files_ignored(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        (self.subs / "macro.docm").write_bytes(b"x")
+        (self.subs / "~$t.docx").write_bytes(b"x")
+        _, text = self.go()
+        self.assertIn("macro.docm: not read", text)
+        self.assertNotIn("~$t.docx", text)
+
+    def test_wrong_layout_setting_gives_one_clear_message(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        cfg = g.json.loads(self.config.read_text())
+        for entry in cfg["template_fields"]:
+            entry.pop("where")                    # the 'after-label' default does not fit these sheets
+        self.config.write_text(g.json.dumps(cfg))
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("next-cell", text)
+        self.assertFalse(self.out.exists())
+
+    def test_a_total_that_cannot_be_split_skips_only_that_student(self):
+        make_workbook(self.workbook, STUDENTS + [["Low Scorer", 34900725005, "9434310342", 5]])
+        self.sheet("low.docx", "34900725005", "LOW SCORER")
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("5 marks cannot be split", text)
+        self.assertEqual([p.name for p in (self.out / "docx").glob("*.docx")], ["34900725002_Tania Dandapat.docx"])
+
+    def test_a_second_layout_with_other_sections_is_handled_per_layout(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        self.sheet("odd.docx", "LME2026410", "SARAT", questions=[("1", "5"), ("2", "5"), ("3", "5")])
+        code, text = self.go()      # --answer 5,4 fits the first layout (2 sections) but not the 3-row one
+        self.assertEqual(code, 1)
+        self.assertIn("odd.docx", text)
+        self.assertTrue((self.out / "docx" / "34900725002_Tania Dandapat.docx").exists())
+
+    def test_existing_output_can_be_kept(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        self.go()
+        target = self.out / "docx" / "34900725002_Tania Dandapat.docx"
+        target.write_bytes(b"old")
+        self.go("--existing", "skip")
+        self.assertEqual(target.read_bytes(), b"old")
+
+    def test_check_mode_writes_nothing(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go("--check")
+        self.assertEqual(code, 0, text)
+        self.assertIn("Check finished: 1 sheet(s)", text)
+        self.assertFalse(self.out.exists())
+
+    def test_template_and_submissions_cannot_be_combined(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go("--template", str(self.subs / "t.docx"))
+        self.assertEqual(code, 1)
+        self.assertIn("not both", text)
+
+    def test_a_folder_without_docx_files(self):
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("no .docx files", text)
+
+    def test_mode_question_when_nothing_is_chosen(self):
+        argv = ["--workbook", str(self.workbook), "--config", str(self.config), "--output", str(self.out),
+                "--no-prompt", "--keep-docx-only"]
+        # no --template/--submissions: the program asks; reply 2 then a folder picker would open,
+        # so only the question itself is checked here
+        args = g.parse_args(argv)
+        text = io.StringIO()
+        with redirect_stdout(text):
+            try:
+                g.choose_sources(args, feeder("2"))
+            except Exception:
+                pass                                # the folder picker needs a screen
+        self.assertIn("Complete sheets that students have filled in", text.getvalue())
+
+
+class NextCellLayout(TempCase):
+    def test_a_merged_cell_counts_once(self):
+        document = Document()
+        table = document.add_table(rows=1, cols=4)
+        table.cell(0, 0).merge(table.cell(0, 1))
+        table.cell(0, 0).text = "Label:"
+        table.cell(0, 2).text = "value"
+        cell = g.label_cell(table.cell(0, 0).paragraphs[0])
+        self.assertEqual(g.next_cell(cell).text, "value")
+
+    def test_the_last_cell_has_no_value_cell(self):
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 1).text = "Label:"
+        with self.assertRaises(g.UserError):
+            g.value_cell(table.cell(0, 1).paragraphs[0], "Label:")
+
+    def test_a_label_outside_a_table_cannot_use_next_cell(self):
+        document = Document()
+        paragraph = document.add_paragraph("Label:")
+        with self.assertRaises(g.UserError):
+            g.value_cell(paragraph, "Label:")
+
+    def test_empty_cell_takes_the_labels_look_without_its_bold(self):
+        path = make_ca2(self.dir / "s.docx", "1", "A", picture=False)
+        document = Document(path)
+        paragraph = g.find_label_paragraph(document, "Marks Obtained:")
+        entry = {"label": "Marks Obtained:", "where": "next-cell"}
+        g.write_field(paragraph, entry, "17", g.font_settings(config()))
+        run = g.value_cell(paragraph, "Marks Obtained:").paragraphs[0].runs[0]
+        self.assertEqual((run.text, run.bold, run.font.name), ("17", False, "Trebuchet MS"))
+
+    def test_empty_cell_uses_the_formatting_word_would_type_with(self):
+        from docx.oxml import OxmlElement
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Label:"
+        mark_paragraph = table.cell(0, 1).paragraphs[0]
+        properties = mark_paragraph._p.get_or_add_pPr()
+        run_properties = OxmlElement("w:rPr")
+        run_properties.append(OxmlElement("w:i"))
+        properties.append(run_properties)
+        g.write_field(table.cell(0, 0).paragraphs[0], {"label": "Label:", "where": "next-cell"}, "x",
+                      g.font_settings(config()))
+        self.assertTrue(table.cell(0, 1).paragraphs[0].runs[0].italic)
+
+    def test_a_filled_cell_keeps_its_own_run_formatting(self):
+        document = Document()
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Label:"
+        run = table.cell(0, 1).paragraphs[0].add_run("old")
+        run.font.name = "Arial"
+        g.write_field(table.cell(0, 0).paragraphs[0], {"label": "Label:", "where": "next-cell"}, "new",
+                      g.font_settings(config()))
+        cell_run = table.cell(0, 1).paragraphs[0].runs[0]
+        self.assertEqual((cell_run.text, cell_run.font.name), ("new", "Arial"))
+
+    def test_custom_font_applies_in_a_value_cell(self):
+        path = make_ca2(self.dir / "s.docx", "1", "A", picture=False)
+        document = Document(path)
+        cfg = config()
+        cfg["font_mode"], cfg["custom_font"] = "custom", {"name": "Calibri", "size_pt": 11}
+        paragraph = g.find_label_paragraph(document, "Marks Obtained:")
+        g.write_field(paragraph, {"label": "Marks Obtained:", "where": "next-cell"}, "9", g.font_settings(cfg))
+        run = g.value_cell(paragraph, "Marks Obtained:").paragraphs[0].runs[0]
+        self.assertEqual((run.font.name, run.font.size.pt), ("Calibri", 11))
+
+    def test_generating_a_new_sheet_also_works_with_next_cell(self):
+        template = make_ca2(self.dir / "t.docx", "", "", mobile="", teacher="", picture=False)
+        cfg = g.load_config(None)
+        cfg = g.merge_config(cfg, g.json.loads(ca2_config_text()) if (g.HERE / "presets" / "ca2.json").exists() else {})
+        cfg["signature"]["enabled"] = False
+        out = self.dir / "o.docx"
+        g.create_docx(template, student(2, "123", name="Ana", mobile="9999999999", marks="12"), None, out, cfg)
+        self.assertEqual(ca2_value(out, "Name of the Student:"), "Ana")
+        self.assertEqual(ca2_value(out, "Roll Number:"), "123")
+        self.assertEqual(ca2_value(out, "Marks Obtained:"), "12")
+
+    def test_where_must_be_a_known_value(self):
+        cfg = config()
+        cfg["template_fields"][0]["where"] = "below"
+        with self.assertRaises(g.UserError):
+            g.validate_config(cfg)
+
+
+# --------------------------------------------------------------------------
+# Official seal (optional)
+# --------------------------------------------------------------------------
+
+TINY_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2P/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDFoooryz7w/9k=")
+
+
+def seal_anchors(document) -> list:
+    return [a for a in document.element.body.iter(qn("wp:anchor"))
+            if a.find(qn("wp:docPr")).get("name") == "Seal"]
+
+
+def make_page(path: Path, picture_name: str | None = None) -> Path:
+    """A small A4 page shaped like the real sheet (narrow side margins), ending with a text line."""
+    document = Document()
+    section = document.sections[0]
+    section.page_width, section.page_height = Cm(21), Cm(29.7)
+    section.left_margin, section.right_margin = Cm(0.8), Cm(0.9)
+    document.add_paragraph("Signature of the student with date")
+    if picture_name:
+        document.add_picture(io.BytesIO(tiny_png()))
+        document.element.body.iter(qn("wp:docPr")).__next__().set("name", picture_name)
+    document.save(path)
+    return path
+
+
+class SealStamping(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.png = self.dir / "seal.png"
+        self.png.write_bytes(tiny_png())
+
+    def stamp(self, **settings):
+        cfg = config()
+        cfg["seal"].update(settings)
+        document = Document(make_page(self.dir / "page.docx"))
+        outcome = g.stamp_seal(document, self.png, cfg)
+        out = self.dir / "stamped.docx"
+        document.save(out)
+        return outcome, Document(out), cfg
+
+    def offset(self, anchor, axis):
+        return int(anchor.find(qn(f"wp:position{axis}")).find(qn("wp:posOffset")).text)
+
+    def test_stamped_just_below_the_last_line_at_the_right(self):
+        outcome, document, _ = self.stamp()
+        self.assertEqual(outcome, "stamped")
+        (anchor,) = seal_anchors(document)
+        text_width = Cm(21) - Cm(0.8) - Cm(0.9)
+        self.assertAlmostEqual(self.offset(anchor, "H"), text_width - Cm(3.3), delta=1000)   # flush right
+        self.assertEqual(self.offset(anchor, "V"), int(Cm(0.3)))                          # small gap
+        self.assertEqual(anchor.find(qn("wp:positionH")).get("relativeFrom"), "margin")
+        self.assertEqual(anchor.find(qn("wp:positionV")).get("relativeFrom"), "paragraph")
+        self.assertEqual(int(anchor.find(qn("wp:extent")).get("cx")), int(Cm(3.3)))
+        self.assertIsNotNone(anchor.find(qn("wp:wrapNone")))                               # does not move text
+
+    def test_the_seal_hangs_from_a_one_point_paragraph_at_the_very_end(self):
+        _, document, _ = self.stamp()
+        last = document.paragraphs[-1]
+        self.assertEqual(document.paragraphs[-2].text, "Signature of the student with date")
+        self.assertEqual(last.text, "")
+        self.assertEqual(last.paragraph_format.line_spacing, Pt(1))
+        self.assertEqual(last.paragraph_format.space_before, Pt(0))
+        self.assertEqual(last.paragraph_format.space_after, Pt(0))
+        self.assertEqual(len(seal_anchors(document)), 1)
+        self.assertIn(last._p, [a.getparent().getparent().getparent() for a in seal_anchors(document)])
+
+    def test_the_picture_goes_in_unchanged(self):
+        _, document, _ = self.stamp()
+        pictures = [part.blob for part in document.part.package.iter_parts()
+                    if part.partname.startswith("/word/media/")]
+        self.assertEqual(pictures, [self.png.read_bytes()])
+
+    def test_alignment_width_gap_and_offset_come_from_the_config(self):
+        text_width = Cm(21) - Cm(0.8) - Cm(0.9)
+        _, document, _ = self.stamp(align="left", offset_cm=1.0, width_cm=2.0, gap_cm=0.5)
+        (anchor,) = seal_anchors(document)
+        self.assertEqual(self.offset(anchor, "H"), int(Cm(1.0)))
+        self.assertEqual(self.offset(anchor, "V"), int(Cm(0.5)))
+        self.assertEqual(int(anchor.find(qn("wp:extent")).get("cx")), int(Cm(2.0)))
+        _, document, _ = self.stamp(align="center", width_cm=4.0)
+        (anchor,) = seal_anchors(document)
+        self.assertAlmostEqual(self.offset(anchor, "H"), (text_width - Cm(4.0)) // 2, delta=1000)
+        _, document, _ = self.stamp(align="right", offset_cm=0.5)
+        (anchor,) = seal_anchors(document)
+        self.assertAlmostEqual(self.offset(anchor, "H"), text_width - Cm(3.3) - Cm(0.5), delta=1000)
+
+    def test_a_sheet_that_already_has_a_seal_is_left_alone(self):
+        for name in ("College Seal", "Image 6 seal"):
+            page = make_page(self.dir / "p.docx", picture_name=name)
+            document = Document(page)
+            before = len(document.paragraphs)
+            self.assertEqual(g.stamp_seal(document, self.png, config()), "already had a seal")
+            self.assertEqual(len(document.paragraphs), before)
+            self.assertEqual(seal_anchors(document), [])
+
+    def test_other_pictures_do_not_count_as_a_seal(self):
+        document = Document(make_page(self.dir / "p.docx", picture_name="Signature of student"))
+        self.assertEqual(g.stamp_seal(document, self.png, config()), "stamped")
+
+    def test_the_word_seal_in_other_text_is_not_confused_with_a_picture(self):
+        document = Document()
+        document.add_paragraph("The seal of the college will be added later")
+        self.assertEqual(g.stamp_seal(document, self.png, config()), "stamped")
+
+    def test_seal_settings_are_validated(self):
+        for bad in ({"align": "middle"}, {"width_cm": 0}, {"width_cm": 20}, {"gap_cm": -1}, {"offset_cm": "x"}):
+            cfg = config()
+            cfg["seal"].update(bad)
+            with self.assertRaises(g.UserError, msg=str(bad)):
+                g.validate_config(cfg)
+
+
+class SealImage(TempCase):
+    def test_a_missing_file(self):
+        with self.assertRaises(g.UserError):
+            g.check_seal_image(self.dir / "nope.png")
+
+    def test_a_file_that_is_not_a_picture(self):
+        bad = self.dir / "seal.png"
+        bad.write_text("this is not an image")
+        with self.assertRaises(g.UserError) as caught:
+            g.check_seal_image(bad)
+        self.assertIn("could not be read as a picture", str(caught.exception))
+
+    def test_a_png_is_fine(self):
+        good = self.dir / "seal.png"
+        good.write_bytes(tiny_png())
+        self.assertEqual(g.check_seal_image(good), [])
+
+    def test_a_jpeg_works_with_a_transparency_warning(self):
+        jpg = self.dir / "seal.jpg"
+        jpg.write_bytes(TINY_JPEG)
+        warnings = g.check_seal_image(jpg)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("transparent", warnings[0])
+        document = Document(make_page(self.dir / "p.docx"))
+        self.assertEqual(g.stamp_seal(document, jpg, config()), "stamped")
+
+    def test_a_big_file_is_warned_about(self):
+        big = self.dir / "big.png"
+        big.write_bytes(tiny_png() + b"\0" * 1_600_000)   # still a valid picture header
+        self.assertTrue(any("MB" in w for w in g.check_seal_image(big)))
+
+
+class SealQuestion(TempCase):
+    """The question asked just before the sheets are made, and the picker behind it."""
+
+    def args(self, *extra):
+        return g.parse_args(["--workbook", "w.xlsx", *extra])
+
+    def test_an_explicit_seal_is_used_without_asking(self):
+        png = self.dir / "s.png"
+        png.write_bytes(tiny_png())
+        asked = []
+        path, warnings = g.choose_seal(self.args("--seal", str(png), "--no-prompt"), 5, asked.append)
+        self.assertEqual((path, warnings, asked), (png, [], []))
+
+    def test_no_prompt_and_check_never_ask(self):
+        def refuse(prompt):
+            raise AssertionError("must not ask")
+        self.assertEqual(g.choose_seal(self.args("--no-prompt"), 5, refuse), (None, []))
+        self.assertEqual(g.choose_seal(self.args("--check"), 5, refuse), (None, []))
+
+    def test_nothing_to_stamp_means_no_question(self):
+        def refuse(prompt):
+            raise AssertionError("must not ask")
+        self.assertEqual(g.choose_seal(self.args(), 0, refuse), (None, []))
+
+    def test_the_question_names_the_number_of_sheets(self):
+        shown = []
+
+        def ask(prompt):
+            shown.append(prompt)
+            return "n"
+        self.assertEqual(g.choose_seal(self.args(), 58, ask), (None, []))
+        self.assertIn("58 sheet(s)", shown[0])
+
+    def test_yes_opens_the_picker(self):
+        png = self.dir / "s.png"
+        png.write_bytes(tiny_png())
+        with mock.patch.object(g, "choose_input_file", return_value=png) as picker:
+            for reply in ("y", "Y", "yes"):
+                self.assertEqual(g.choose_seal(self.args(), 3, lambda _: reply), (png, []))
+        self.assertEqual(picker.call_count, 3)
+
+    def test_anything_else_means_no_seal(self):
+        with mock.patch.object(g, "choose_input_file") as picker:
+            for reply in ("", "n", "no", "maybe"):
+                self.assertEqual(g.choose_seal(self.args(), 3, lambda _: reply), (None, []))
+        picker.assert_not_called()
+
+    def test_closing_the_input_means_no_seal(self):
+        self.assertEqual(g.choose_seal(self.args(), 3, feeder()), (None, []))
+
+    def test_cancelling_the_picker_carries_on_without_a_seal(self):
+        with mock.patch.object(g, "choose_input_file", side_effect=g.UserError("No seal image was selected.")):
+            with redirect_stdout(io.StringIO()) as shown:
+                self.assertEqual(g.choose_seal(self.args(), 3, lambda _: "y"), (None, []))
+        self.assertIn("without a seal", shown.getvalue())
+
+    def test_a_picker_that_cannot_open_says_how_to_continue(self):
+        with mock.patch.object(g, "choose_input_file", side_effect=RuntimeError("no display")):
+            with self.assertRaises(g.UserError) as caught:
+                g.choose_seal(self.args(), 3, lambda _: "y")
+        self.assertIn("--seal PATH", str(caught.exception))
+
+    def test_a_chosen_file_that_is_not_a_picture_is_refused(self):
+        bad = self.dir / "s.png"
+        bad.write_text("nope")
+        with mock.patch.object(g, "choose_input_file", return_value=bad):
+            with self.assertRaises(g.UserError):
+                g.choose_seal(self.args(), 3, lambda _: "y")
+
+
 class Release(TempCase):
     def test_version_flag(self):
         with redirect_stdout(io.StringIO()) as buffer:
@@ -660,7 +1382,7 @@ class Release(TempCase):
         if not ignore.exists():
             self.skipTest("no .gitignore beside the script")
         text = ignore.read_text()
-        for pattern in ("*.xlsx", "*.docx", "output/", "config.local.json", "section_rules.json",
+        for pattern in ("*.xlsx", "*.docx", "output/", "*.local.json", "section_rules.json", "submissions/", "seal/",
                         "!examples/*.docx", "!examples/*.xlsx"):
             self.assertIn(pattern, text)
         # the exceptions must come after the broad patterns, or they do nothing
@@ -739,7 +1461,7 @@ class LocalConfig(TempCase):
         ignore = (g.HERE / ".gitignore")
         if ignore.exists():  # the packaged copy ships it; a bare checkout of the script may not
             text = ignore.read_text()
-            self.assertIn("config.local.json", text)
+            self.assertIn("*.local.json", text)
             self.assertIn("section_rules.json", text)
 
 
