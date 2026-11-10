@@ -2,15 +2,25 @@
 
 [![tests](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml/badge.svg)](https://github.com/Subhrajit-Mandal/Top-Sheet-Filing-V2/actions/workflows/tests.yml)
 
-Generate one completed Word top sheet and PDF per student from any Excel workbook and compatible DOCX template.
+Prepare the marks sheets (top sheets) for a whole class from one Excel workbook of marks. The program works in two ways:
 
-The workbook and template are supplied at runtime, so their filenames and locations are entirely up to the user. Original input files are never changed.
+| | **Generate** | **Complete submitted sheets** |
+| --- | --- | --- |
+| You give it | the workbook and a blank Word template | the workbook and a folder of Word sheets the students filled in |
+| It produces | a sheet and a PDF for every student: details from the workbook, the marks, the question-wise marks and a typed signature | the students' own sheets with the marks added; their details, signature and pictures stay exactly as they made them |
+| Students who sent no sheet | | optionally made from a template, and clearly marked as such in the report |
+
+In both ways the official seal can be stamped on every sheet, kept as a separate image file. The workbook, template and folders are chosen at run time, so their names and locations are up to you. Original input files are never changed.
 
 Nothing about the sheet's layout is hard-coded. What gets filled, which workbook column feeds which label, the exam date, the full marks, the fonts and the duplicate rules all live in [`config.json`](config.json). The values that change from exam to exam are asked for when you start a run, so you rarely need to edit a config file by hand. The question rows and their marks are read from the template itself, so a top sheet with more rows or fewer columns works without touching the code.
 
+## Contents
+
+[Features](#features) · [Requirements](#requirements) · [Quick start](#quick-start) · [Completing submitted sheets](#completing-sheets-that-students-filled-in) · [Settings screen](#settings-screen) · [Official seal](#official-seal-optional) · [Configuration](#configuration-configjson) · [Input requirements](#input-requirements) · [Sections](#sections-answer-any-n) · [Command-line options](#command-line-options-optional) · [Run report](#run-report-run_reportcsv) · [Troubleshooting](#troubleshooting) · [Known limitations](#known-limitations) · [Intended use](#intended-use) · [Project layout](#project-layout)
+
 ## Features
 
-- Works in two ways: **generate** a new sheet for every student from a template, or **complete the sheets students filled in themselves** (they keep their own details and signature; the program adds the marks).
+- Works in two ways: **generate** a new sheet for every student from a template, or **complete the sheets students filled in themselves** (they keep their own details and signature; the program adds the marks). Students who sent no sheet can be given a generated one, clearly marked in the report.
 - Reads student details and total marks from an XLSX workbook. **The roll number is the primary key.**
 - Fills the labels you declare in `config.json` in a DOCX top-sheet template, keeping the template's own font and formatting (or a custom font, your choice).
 - Reads the question rows and their `Marks Allotted` from the template's marks table, groups them into sections ("answer any 5 of 1.a to 1.g"), and spreads each student's total across the answered questions so that it adds up exactly.
@@ -19,8 +29,9 @@ Nothing about the sheet's layout is hard-coded. What gets filled, which workbook
 - Optionally stamps the official seal, kept as a separate image file, just below the last line of every sheet.
 - Checks the whole workbook before generating anything: duplicate roll numbers, bad marks, missing columns, missing template labels.
 - Creates files named `Rollnumber_Name.docx` and `Rollnumber_Name.pdf`, and checks for filename collisions.
-- Writes a `run_report.csv` with every student's question-wise marks and status.
-- Generates DOCX files in parallel, then exports PDFs with Microsoft Word, or with LibreOffice if Word is not available.
+- Never stops for one bad file: a sheet that cannot be used is skipped and listed by name, and a picture saved with a wrong checksum is recovered instead of rejecting the whole file.
+- Writes a `run_report.csv` with every student's status, question-wise marks and notes.
+- Exports PDFs with Microsoft Word, or with LibreOffice if Word is not available (new sheets are generated in parallel).
 
 ## Requirements
 
@@ -46,7 +57,7 @@ On Windows you can instead double-click `run.bat`. It finds Python, installs the
 Two standard pickers will open in sequence:
 
 1. Choose the student Excel workbook (`.xlsx`).
-2. The program asks what you want to do: **1** generate new sheets from a template, or **2** complete sheets that students filled in. Choose the Word template (`.docx`) for 1, or the folder of student sheets for 2.
+2. The program asks what you want to do: **1** generate new sheets from a template, or **2** complete sheets that students filled in. Choose the Word template (`.docx`) for 1. For 2, choose the folder of student sheets; the program then also asks whether to make a sheet from a template for students who sent none.
 
 Next comes a short settings screen (see [Settings screen](#settings-screen)). Press Enter to accept the values shown, or type a number to change one.
 
@@ -171,9 +182,9 @@ Every value that may change between exams is here. Settings you leave out use th
 | `template_fields` | The labels to fill, see below |
 | `seal` | Size and position of the optional seal: `width_cm`, `gap_cm`, `align`, `offset_cm`. The image is never stored here |
 | `fixed_values` | Overrides for fixed-value labels, as `{"Subject Teacher:": "Dr. A. Sen"}`. Normally written by the settings screen into `config.local.json` |
-| `marks_table` | Header texts of the marks table in the template; `null` switches question-wise marks off |
+| `marks_table` | The header texts of the marks table in the template: `question_header`, `allotted_header`, `awarded_header`. `null` switches question-wise marks off |
 | `ignore_question_labels` | Marks-table rows with these labels (for example `total`) are not questions |
-| `signature` | `enabled`, the label to insert above, the five fonts, and the name and date sizes |
+| `signature` | `enabled`, `label` (the line the typed signature goes above), `fonts` (the five handwriting fonts), `name_size_pt` and `date_size_pt` |
 | `duplicates` | `"stop"`, `"keep-first"` or `"keep-last"` for conflicting rows with the same roll number |
 | `existing_files` | `"overwrite"` or `"skip"` for files already in the output folder |
 | `unreachable_marks` | `"stop"` or `"skip"` for a total that cannot be split under the section rules |
@@ -241,7 +252,7 @@ A student's total can range from 9 to 25 under these rules (full marks in the co
 
 - Rows with sub-part labels (`1.a)`, `1.b)` ...) form one section, and consecutive plain numbers (`2`, `3`, `4` ...) form another. If that grouping is wrong, type your own row ranges at the prompt, for example `1-7,8-13`.
 - In every section **exactly N** questions are answered, each with at least 1 mark and at most its `Marks Allotted`. The other questions stay blank. The marks add up exactly to `Marks Obtained`.
-- The reachable range is shown. A total outside it (for example 5 when N = 5 and 4 means at least 9) cannot be split, so the run stops and names the student (`"unreachable_marks": "skip"` skips them instead). `Ab` leaves every question blank.
+- The reachable range is shown. A total outside it (for example 5 when N = 5 and 4 means at least 9) cannot be split, so when generating, the run stops and names the student (`"unreachable_marks": "skip"` skips them instead). When completing submitted sheets, or making sheets for students who sent nothing, that student is always skipped and listed, so the rest of the run carries on. `Ab` leaves every question blank.
 - The answers are saved in `section_rules.json` (ignored by git), tied to a fingerprint of the template's question rows. A different template asks again; `--ask-sections` forces the questions for the current one. `--answer 5,4` supplies the numbers without prompting.
 - The split is varied but repeatable for a given roll number, template and rules.
 
@@ -316,6 +327,29 @@ py .\generate_top_sheets.py --workbook ".\students.xlsx" --template ".\template.
 
 Files are named `Rollnumber_Name.docx` and `Rollnumber_Name.pdf`. Because the roll number is unique, two students can never share a name; the program still verifies that no two names clean up to the same filename. Files left over from a previous run follow `existing_files`: `"overwrite"` (with a notice) or `"skip"`.
 
+## Run report (`run_report.csv`)
+
+Every run writes `run_report.csv` into the output folder; it opens in Excel. The columns are:
+
+- **Generate mode:** `Roll`, `Name`, `Workbook row`, `Marks obtained`, `Question-wise marks`, `Status`, `DOCX`, `PDF`, `Seal`, `Notes`.
+- **Submitted sheets:** `Roll`, `Name`, `Submitted file`, `Workbook row`, `Marks obtained`, `Question-wise marks`, `Status`, `Seal`, `Notes`.
+
+`Seal` shows `stamped` or `already had a seal` when a seal was used. `Notes` holds warnings, differences from the workbook, repaired pictures and the reason for anything that was skipped. `Status` is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `written` | A new sheet was created (generate mode). |
+| `FAILED` | A new sheet could not be created; the reason is in `Notes` (generate mode). |
+| `completed` | The student's own sheet was completed. |
+| `SKIPPED` | A submitted file could not be used; the reason is in `Notes`. |
+| `FILE RECEIVED, NOT USED` | The student sent a file that could not be used. The student is identified from the start of the file name, for this label only. |
+| `NO SUBMISSION` | The student sent nothing and no sheet was made. If a template was given but the total could not be split, `Notes` says so. |
+| `GENERATED (typed signature)` | The student sent nothing, so a sheet was made from the template with a typed (generated) signature. |
+| `GENERATED (no signature)` | The same, when the typed signature is switched off in the config. |
+| `GENERATION FAILED` | A sheet for a student who sent nothing could not be made; the reason is in `Notes`. |
+| `kept existing` | A file with that name was already in the output folder and `existing_files` is `skip`. |
+| `NOTE` | A warning that belongs to the whole run, not to one student (generate mode). |
+
 ## Tests
 
 ```powershell
@@ -323,6 +357,22 @@ py -m unittest -v
 ```
 
 The tests build their own small templates and workbooks, so they need neither your real template nor any student data.
+
+## Project layout
+
+```
+generate_top_sheets.py        the program
+config.json                   default settings (see Configuration)
+presets/ca2.json             settings for sheets that keep each value in the cell next to its label
+examples/                     a sample workbook (fake students) and a template to try it with
+test_generate_top_sheets.py   automated tests
+run.bat                       Windows double-click launcher
+requirements.txt              Python packages
+.github/workflows/tests.yml   runs the tests on every push
+CHANGELOG.md  LICENSE  README.md
+```
+
+Created while you work, and ignored by git so that personal data and the seal never get committed: `output/`, `submissions/`, `seal/` and `seals/`, `config.local.json` (your saved answers) and `section_rules.json` (your saved section answers).
 
 ## Troubleshooting
 
