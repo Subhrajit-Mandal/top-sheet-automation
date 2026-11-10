@@ -3,6 +3,41 @@
 All notable changes to this project are listed here, newest first.
 The version number is also printed by `py .\generate_top_sheets.py --version`.
 
+## 2.3.0 - 2026-11-09
+
+### Added
+- Pictures saved with a wrong checksum (for example a checksum of zero, which some apps write) no longer make a student's file unusable. The picture is read exactly as it is, the sheet is completed, and the sheet is listed for a look. JPEGs and PNGs are checked, and the note says whether the picture "looks complete" or "may be damaged". Other damaged parts are still refused.
+- Students who sent no file at all can get a sheet made from the standard template, with workbook data, the question-wise marks and the typed signature (and the seal, if chosen): give `--template` together with `--submissions`, or answer the new question in an interactive run. The report marks them `GENERATED (typed signature)` with the note "no sheet was submitted".
+- A tip when roll numbers on submitted sheets are not in the workbook: add them and run again with `--existing skip`.
+
+### Changed
+- A student whose file was received but could not be used is reported as `FILE RECEIVED, NOT USED` (with the file name and the reason) instead of `NO SUBMISSION`, and is never replaced by a generated sheet. The roll number taken from the file name is used for this label only.
+- `--template` and `--submissions` can now be used together.
+
+## 2.2.0 - 2026-11-07
+
+### Added
+- Optional official seal, kept as a separate image file and stamped on every sheet the program creates, in both modes. An interactive run asks "Stamp the official seal on all N sheet(s)?" just before the sheets are made and opens a file picker for the image; `--seal PATH` does the same without asking.
+- The seal is placed at the very end of the document, towards the bottom right, a small distance below the last line, without changing the page layout. `seal` settings in `config.json` set its width, gap, alignment and offset.
+- A sheet that already has a picture named like a seal is not stamped a second time and is listed. The summary reports how many sheets were stamped, and `run_report.csv` has a new `Seal` column.
+- `seal/` and `seals/` are ignored by git.
+
+### Changed
+- The README's intended-use note now covers the seal.
+
+## 2.1.0 - 2026-11-07
+
+### Added
+- Complete sheets that students filled in themselves: `--submissions FOLDER`. Each sheet is matched to the workbook by the roll number written in it, the marks and question-wise marks are added, and the student's own text, signature and pictures are left untouched. Differences from the workbook are listed, blank fields are filled, and students with no sheet are listed.
+- A sheet that cannot be used (not a readable Word file, a picture missing inside it, a different layout, an unknown or repeated roll number) is skipped and listed by name; it never stops the run.
+- `where` setting for each field in `template_fields`: `"after-label"` (default) or `"next-cell"`, for sheets that keep the value in the cell to the right of the label. Works when generating sheets as well.
+- `presets/ca2.json` for the CA2 sheet, and a question at the start of an interactive run: generate new sheets, or complete submitted ones.
+- `submissions/` and `*.local.json` are ignored by git.
+
+### Changed
+- A new Marks Awarded entry takes the alignment of the Marks Allotted column when the cell has none of its own.
+- The README's intended-use note now distinguishes generated signatures from sheets the students signed themselves.
+
 ## 2.0.0 - 2026-11-05
 
 ### Added

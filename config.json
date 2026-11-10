@@ -74,6 +74,12 @@
   "duplicates": "stop",
   "existing_files": "overwrite",
   "unreachable_marks": "stop",
+  "seal": {
+    "width_cm": 3.3,
+    "gap_cm": 0.3,
+    "align": "right",
+    "offset_cm": 0.0
+  },
   "full_marks_label": "Full Marks:",
   "mobile_check": {
     "column": "Mobile Number",

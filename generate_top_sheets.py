@@ -20,13 +20,17 @@ import argparse
 import copy
 import csv
 import hashlib
+import io
 import json
 import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import zipfile
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -34,15 +38,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.shared import Pt
-from docx.table import Table
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls, qn
+from docx.shared import Cm, Pt
+from docx.table import Table, _Cell
 from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
 
-__version__ = "2.0.0"
+__version__ = "2.3.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = HERE / "config.json"
@@ -72,6 +77,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Every label the program fills. Use "column" (exact workbook header) or
     # "value" (fixed text; {exam_date} and {full_marks} are expanded).
     # A fixed value of "" leaves that label exactly as the template has it.
+    # Optional "where": "after-label" (default: the value follows the label in the same
+    # paragraph) or "next-cell" (the value is in the table cell to the right of the label).
     # (The settings screen saves its answers for fixed values in "fixed_values".)
     "template_fields": [
         {"label": "Name of the Student:", "column": "Name"},
@@ -115,6 +122,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "existing_files": "overwrite",
     # A total that cannot be split under the section rules: "stop" or "skip".
     "unreachable_marks": "stop",
+    # Where the optional official seal goes (the image itself is never stored in a config:
+    # it is chosen at the start of each run or given with --seal). It is placed just below the
+    # last line of the document. "align": "right", "left" or "center"; "offset_cm" moves it
+    # inward from the chosen side.
+    "seal": {"width_cm": 3.3, "gap_cm": 0.3, "align": "right", "offset_cm": 0.0},
     # Optional sanity checks that only ever warn. null switches them off.
     "full_marks_label": "Full Marks:",
     "mobile_check": {"column": "Mobile Number", "digits": 10},
@@ -185,14 +197,25 @@ def validate_config(config: dict) -> None:
         where = f"config.template_fields[{index}]"
         if not isinstance(entry, dict) or not str(entry.get("label", "")).strip():
             raise UserError(f"{where} needs a non-empty 'label'.")
-        extra = set(entry) - {"label", "column", "value"}
+        extra = set(entry) - {"label", "column", "value", "where"}
         if extra:
             raise UserError(f"{where} has unknown key(s): {', '.join(sorted(extra))}.")
         if ("column" in entry) == ("value" in entry):
             raise UserError(f"{where} ('{entry['label']}') needs exactly one of 'column' or 'value'.")
+        if entry.get("where", "after-label") not in ("after-label", "next-cell"):
+            raise UserError(f"{where} ('{entry['label']}'): 'where' must be 'after-label' or 'next-cell'.")
         if entry["label"] in seen_labels:
             raise UserError(f"{where}: label '{entry['label']}' is declared twice.")
         seen_labels.add(entry["label"])
+
+    seal = config["seal"]
+    for key in ("width_cm", "gap_cm", "offset_cm"):
+        if not isinstance(seal[key], (int, float)) or isinstance(seal[key], bool) or seal[key] < 0:
+            raise UserError(f"config.seal.{key} must be a number of at least 0.")
+    if seal["width_cm"] <= 0 or seal["width_cm"] > 15:
+        raise UserError("config.seal.width_cm must be more than 0 and at most 15.")
+    if seal["align"] not in ("left", "center", "right"):
+        raise UserError("config.seal.align must be 'left', 'center' or 'right'.")
 
     fixed_labels = [e["label"] for e in config["template_fields"] if "value" in e]
     for label, value in config["fixed_values"].items():
@@ -562,6 +585,36 @@ def find_label_paragraph(document, label: str, required: bool = True) -> Paragra
     )
 
 
+def label_cell(paragraph: Paragraph) -> _Cell | None:
+    parent = paragraph._parent
+    return parent if isinstance(parent, _Cell) else None
+
+
+def next_cell(cell: _Cell) -> _Cell | None:
+    """The table cell to the right of `cell` in the same row (merged cells count once)."""
+    tc = cell._tc.getnext()
+    while tc is not None and tc.tag != qn("w:tc"):
+        tc = tc.getnext()
+    return _Cell(tc, cell._parent) if tc is not None else None
+
+
+def value_cell(paragraph: Paragraph, label: str) -> _Cell:
+    cell = label_cell(paragraph)
+    if cell is None:
+        raise UserError(f"'{label}' is not inside a table cell, so its value cannot be in the next cell.")
+    target = next_cell(cell)
+    if target is None:
+        raise UserError(f"There is no cell to the right of '{label}' to hold its value.")
+    return target
+
+
+def read_field(paragraph: Paragraph, label: str, where: str = "after-label") -> str:
+    """What is written for a label: the text after it, or the text of the cell to its right."""
+    if where == "next-cell":
+        return re.sub(r"\s+", " ", value_cell(paragraph, label).text).strip()
+    return paragraph_text(paragraph).split(label, 1)[1].strip()
+
+
 def set_run_font(run, name: str, size_pt: float | None = None) -> None:
     run.font.name = name
     fonts = run._r.rPr.rFonts
@@ -611,6 +664,40 @@ def fill_field(paragraph: Paragraph, label: str, value: str, font: dict) -> None
     separator = "" if label[-1:].isspace() else " "
     new_run = paragraph.add_run(separator + value)
     copy_run_format(runs[label_index], new_run, font)
+
+
+def fill_cell(cell: _Cell, value: str, label_paragraph: Paragraph, font: dict) -> None:
+    """Put `value` in a value cell, looking like what Word would type there."""
+    paragraph = cell.paragraphs[0]
+    runs = paragraph.runs
+    if runs:  # keep the formatting the cell already has
+        runs[0].text = value
+        for extra in runs[1:]:
+            extra.text = ""
+        run = runs[0]
+    else:
+        run = paragraph.add_run(value)
+        properties = paragraph._p.pPr
+        mark = properties.find(qn("w:rPr")) if properties is not None else None
+        if mark is not None:  # the formatting Word would use for typing in this cell
+            formatting = copy.deepcopy(mark)
+            for tracked in ("w:ins", "w:del", "w:moveFrom", "w:moveTo", "w:rPrChange"):
+                for element in formatting.findall(qn(tracked)):
+                    formatting.remove(element)
+            run._r.insert(0, formatting)
+        else:  # otherwise the label's own look, without its bold
+            label_runs = label_paragraph.runs
+            copy_run_format(label_runs[-1] if label_runs else None, run, None)
+            run.bold = False
+    if font["mode"] == "custom":
+        set_run_font(run, font["name"], font.get("size_pt"))
+
+
+def write_field(paragraph: Paragraph, entry: dict, value: str, font: dict) -> None:
+    if entry.get("where", "after-label") == "next-cell":
+        fill_cell(value_cell(paragraph, entry["label"]), value, paragraph, font)
+    else:
+        fill_field(paragraph, entry["label"], value, font)
 
 
 # --------------------------------------------------------------------------
@@ -975,6 +1062,9 @@ def populate_marks_awarded(document, config: dict, allocation: dict[str, int], f
         cells = table.rows[question.table_row].cells
         awarded, allotted = cells[marks.awarded_col], cells[marks.allotted_col]
         paragraph = awarded.paragraphs[0]
+        if paragraph.alignment is None:  # line up with the Marks Allotted column
+            paragraph.alignment = next((p.alignment for p in allotted.paragraphs
+                                        if p.alignment is not None), None)
         for run in paragraph.runs:
             run.text = ""
         reference = next((r for p in allotted.paragraphs for r in p.runs if r._r.rPr is not None), None)
@@ -1069,31 +1159,154 @@ def analyse_template(template_path: Path, config: dict) -> tuple[MarksTable | No
 
 
 # --------------------------------------------------------------------------
+# Official seal (optional): stamped just below the last line of every sheet
+# --------------------------------------------------------------------------
+
+def check_seal_image(path: Path) -> list[str]:
+    """Raise UserError if the seal cannot be used; otherwise return any warnings."""
+    if not path.is_file():
+        raise UserError(f"The seal image was not found: {path}")
+    try:
+        from docx.image.image import Image
+        image = Image.from_file(str(path))
+    except Exception as error:
+        raise UserError(
+            f"'{path.name}' could not be read as a picture ({type(error).__name__}). Use a PNG or JPG file."
+        ) from error
+    warnings: list[str] = []
+    if image.content_type != "image/png":
+        warnings.append(
+            f"The seal image is not a PNG ({image.content_type}). It cannot have a transparent "
+            "background, so a white box may show around the seal. A PNG with a transparent background is best."
+        )
+    size = path.stat().st_size
+    if size > 1_500_000:
+        warnings.append(
+            f"The seal image is {size / 1_000_000:.1f} MB and a copy goes into every sheet; "
+            "a smaller file keeps the sheets small."
+        )
+    return warnings
+
+
+def has_seal_picture(document) -> bool:
+    """True if the document already holds a picture or shape whose name or description says 'seal'."""
+    for doc_pr in document.element.body.iter(qn("wp:docPr")):
+        if "seal" in f"{doc_pr.get('name', '')} {doc_pr.get('descr', '')}".casefold():
+            return True
+    return False
+
+
+def stamp_seal(document, image_path: Path, config: dict) -> str:
+    """Put the seal just below the last line of the document, towards the bottom right.
+
+    A one-point-high paragraph is added after the last line and the seal floats from it, so the
+    seal follows wherever the document really ends and the page layout does not change.
+    Returns "stamped", or "already had a seal" if the sheet already contains one.
+    """
+    if has_seal_picture(document):
+        return "already had a seal"
+    settings = config["seal"]
+    section = document.sections[-1]
+    text_width = section.page_width - section.left_margin - section.right_margin
+    width = Cm(settings["width_cm"])
+    offset = Cm(settings["offset_cm"])
+    if settings["align"] == "right":
+        x = text_width - width - offset
+    elif settings["align"] == "left":
+        x = offset
+    else:
+        x = (text_width - width) // 2
+    x = max(int(x), 0)
+    y = int(Cm(settings["gap_cm"]))
+
+    paragraph = document.add_paragraph()
+    spacing = paragraph.paragraph_format
+    spacing.space_before = Pt(0)
+    spacing.space_after = Pt(0)
+    spacing.line_spacing = Pt(1)
+    spacing.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    run = paragraph.add_run()
+    run.add_picture(str(image_path), width=width)
+
+    inline = run._r.xpath(".//wp:inline")[0]
+    extent = inline.find(qn("wp:extent"))
+    shape_id = inline.find(qn("wp:docPr")).get("id")
+    graphic = inline.find(qn("a:graphic"))
+    anchor = parse_xml(
+        f'<wp:anchor {nsdecls("wp", "a")} distT="0" distB="0" distL="0" distR="0" simplePos="0" '
+        'relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
+        '<wp:simplePos x="0" y="0"/>'
+        f'<wp:positionH relativeFrom="margin"><wp:posOffset>{x}</wp:posOffset></wp:positionH>'
+        f'<wp:positionV relativeFrom="paragraph"><wp:posOffset>{y}</wp:posOffset></wp:positionV>'
+        f'<wp:extent cx="{extent.get("cx")}" cy="{extent.get("cy")}"/>'
+        '<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>'
+        f'<wp:docPr id="{shape_id}" name="Seal" descr="Official seal"/>'
+        '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+        '</wp:anchor>'
+    )
+    anchor.append(graphic)
+    inline.getparent().replace(inline, anchor)
+    return "stamped"
+
+
+def choose_seal(args: argparse.Namespace, count: int,
+                input_fn: Callable[[str], str]) -> tuple[Path | None, list[str]]:
+    """Ask whether to stamp the seal (unless --seal says so) and let the user pick the image."""
+    if count == 0:
+        return None, []
+    path = args.seal
+    if path is None:
+        if args.no_prompt or args.check:
+            return None, []
+        try:
+            reply = input_fn(f"\nStamp the official seal on all {count} sheet(s)? [y/N]: ")
+        except EOFError:
+            return None, []
+        if reply.strip().casefold() not in {"y", "yes"}:
+            return None, []
+        try:
+            path = choose_input_file("seal image", (".png", ".jpg", ".jpeg"))
+        except UserError:
+            info("No seal image was chosen, so the sheets will be created without a seal.")
+            return None, []
+        except Exception as error:
+            raise UserError(
+                f"The file picker could not be opened ({type(error).__name__}). "
+                "Give the seal image with --seal PATH instead."
+            ) from error
+    return path, check_seal_image(path)
+
+
+# --------------------------------------------------------------------------
 # DOCX job (runs in worker processes)
 # --------------------------------------------------------------------------
 
 def create_docx(template_path: Path, student: Student, allocation: dict[str, int] | None,
-                output_path: Path, config: dict) -> None:
+                output_path: Path, config: dict, seal_path: Path | None = None) -> str:
+    """Write one sheet. Returns the seal outcome: "", "stamped" or "already had a seal"."""
     document = Document(template_path)
     font = font_settings(config)
     for entry in config["template_fields"]:
         value = field_value(entry, student, config)
         if value:
-            fill_field(find_label_paragraph(document, entry["label"]), entry["label"], value, font)
+            write_field(find_label_paragraph(document, entry["label"]), entry, value, font)
     if allocation:
         populate_marks_awarded(document, config, allocation, font)
     if config["signature"]["enabled"]:
         add_student_signature(document, student, config)
+    seal = stamp_seal(document, seal_path, config) if seal_path else ""
     document.save(output_path)
+    return seal
 
 
-def docx_job(job: tuple) -> tuple[str, str | None]:
-    template_path, student, allocation, output_path, config = job
+def docx_job(job: tuple) -> tuple[str, str | None, str]:
+    template_path, student, allocation, output_path, config, seal_path = job
     try:
-        create_docx(Path(template_path), student, allocation, Path(output_path), config)
-        return student.roll, None
+        seal = create_docx(Path(template_path), student, allocation, Path(output_path), config,
+                           Path(seal_path) if seal_path else None)
+        return student.roll, None, seal
     except Exception as error:  # reported per student, the batch continues
-        return student.roll, f"{type(error).__name__}: {error}"
+        return student.roll, f"{type(error).__name__}: {error}", ""
 
 
 # --------------------------------------------------------------------------
@@ -1200,6 +1413,8 @@ class Job:
     allocation: dict[str, int] | None
     write_docx: bool = True
     write_pdf: bool = True
+    seal: str = ""
+    status: str = ""
     notes: list[str] = field(default_factory=list)
 
 
@@ -1258,7 +1473,7 @@ def write_report(path: Path, jobs: list[Job], marks: MarksTable | None, failures
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["Roll", "Name", "Workbook row", "Marks obtained", "Question-wise marks",
-                         "Status", "DOCX", "PDF", "Notes"])
+                         "Status", "DOCX", "PDF", "Seal", "Notes"])
         for job in jobs:
             student = job.student
             split = ""
@@ -1267,10 +1482,10 @@ def write_report(path: Path, jobs: list[Job], marks: MarksTable | None, failures
             status = "FAILED" if student.roll in failures else ("kept existing" if not job.write_docx else "written")
             writer.writerow([student.roll, student.name, student.row,
                              student.values.get(marks_header, ""),
-                             split, status, job.docx_path.name, job.pdf_path.name,
+                             split, status, job.docx_path.name, job.pdf_path.name, job.seal,
                              "; ".join(job.notes + ([failures[student.roll]] if student.roll in failures else []))])
         for note in notes:
-            writer.writerow(["", "", "", "", "", "NOTE", "", "", note])
+            writer.writerow(["", "", "", "", "", "NOTE", "", "", "", note])
 
 
 # --------------------------------------------------------------------------
@@ -1397,6 +1612,526 @@ def review_settings(config: dict, changes: dict, *, template_full_marks: int | N
 
 
 # --------------------------------------------------------------------------
+# Completing sheets that students have filled in
+# --------------------------------------------------------------------------
+
+EMPTY_ROLL = "field is empty"
+
+# Parts of a Word file that are only pictures. A wrong checksum on one of these is recoverable;
+# a wrong checksum anywhere else could mean the text itself is damaged, so that file is not used.
+PICTURE_PARTS = ("word/media/", "docProps/thumbnail")
+
+
+def read_member_unchecked(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Read one member of a zip file without trusting its stored checksum."""
+    handle = archive.fp
+    handle.seek(info.header_offset)
+    header = handle.read(30)
+    name_length, extra_length = struct.unpack("<HH", header[26:30])
+    handle.seek(info.header_offset + 30 + name_length + extra_length)
+    raw = handle.read(info.compress_size)
+    if info.compress_type == zipfile.ZIP_STORED:
+        return raw
+    if info.compress_type == zipfile.ZIP_DEFLATED:
+        return zlib.decompressobj(-15).decompress(raw)
+    raise ValueError(f"unsupported compression method {info.compress_type}")
+
+
+def png_is_intact(data: bytes) -> bool:
+    """A PNG carries its own checksum on every chunk, so it can be verified independently."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+    position = 8
+    while position + 12 <= len(data):
+        length = struct.unpack(">I", data[position:position + 4])[0]
+        end = position + 8 + length + 4
+        if end > len(data):
+            return False
+        if zlib.crc32(data[position + 4:end - 4]) & 0xFFFFFFFF != struct.unpack(">I", data[end - 4:end])[0]:
+            return False
+        if data[position + 4:position + 8] == b"IEND":
+            return True
+        position = end
+    return False
+
+
+def picture_verdict(name: str, data: bytes) -> str:
+    lower = name.casefold()
+    if lower.endswith((".jpg", ".jpeg")):
+        complete = data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+        return "the picture looks complete" if complete else "the picture may be damaged"
+    if lower.endswith(".png"):
+        return "the picture looks complete" if png_is_intact(data) else "the picture may be damaged"
+    return "the picture could not be checked"
+
+
+def rebuild_docx_with_valid_checksums(path: Path) -> tuple[bytes, list[str]]:
+    """Copy a Word file, recovering pictures whose stored checksum is wrong.
+
+    Some apps save pictures with a checksum of zero. The picture data is fine, but Python
+    refuses to read the file. Only pictures are recovered; anything else that fails is an error.
+    """
+    notes: list[str] = []
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            try:
+                data = source.read(info.filename)
+            except zipfile.BadZipFile as error:
+                if "CRC" not in str(error) or not info.filename.startswith(PICTURE_PARTS):
+                    raise zipfile.BadZipFile(
+                        f"the part '{info.filename}' is damaged and is not a picture ({error})") from error
+                try:
+                    data = read_member_unchecked(source, info)
+                except (zlib.error, ValueError, struct.error) as inner:
+                    raise zipfile.BadZipFile(
+                        f"the picture '{info.filename}' is damaged and cannot be read ({inner})") from inner
+                notes.append(f"picture '{info.filename}' had a wrong checksum and was recovered "
+                             f"({picture_verdict(info.filename, data)})")
+            target.writestr(info.filename, data)
+    return buffer.getvalue(), notes
+
+
+def open_document(path: Path) -> tuple[Document, list[str], bytes | None]:
+    """Open a Word file. Returns (document, notes about any repair, repaired bytes or None)."""
+    try:
+        return Document(path), [], None
+    except zipfile.BadZipFile as error:
+        if "CRC" not in str(error):
+            raise
+    data, notes = rebuild_docx_with_valid_checksums(path)
+    return Document(io.BytesIO(data)), notes, data
+
+
+@dataclass
+class Submission:
+    path: Path
+    roll: str = ""
+    student: Student | None = None
+    marks: MarksTable | None = None
+    problem: str = ""
+    notes: list[str] = field(default_factory=list)
+    stem: str = ""
+    allocation: dict[str, int] | None = None
+    status: str = ""
+    seal: str = ""
+    repaired: bytes | None = None
+
+
+def roll_entry(config: dict) -> dict:
+    for entry in config["template_fields"]:
+        if entry.get("column") == config["columns"]["roll_number"]:
+            return entry
+    raise UserError(
+        "Completing submitted sheets needs a template_fields entry fed by the roll number column "
+        f"('{config['columns']['roll_number']}'), so each sheet can be matched to the workbook."
+    )
+
+
+def roll_key(text: str) -> str:
+    """Roll numbers are compared without case or spaces: 'LME 2026410' equals 'lme2026410'."""
+    return re.sub(r"\s+", "", normalise_roll(text)).casefold()
+
+
+def list_submission_files(folder: Path) -> tuple[list[Path], list[str]]:
+    files: list[Path] = []
+    refused: list[str] = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.name.startswith("~$"):  # "~$" is Word's temporary lock file
+            continue
+        suffix = path.suffix.casefold()
+        if suffix == ".docx":
+            files.append(path)
+        elif suffix in {".docm", ".doc", ".dotx", ".dotm", ".odt", ".pdf"}:
+            refused.append(f"{path.name}: not read (only .docx files are accepted)")
+    if not files:
+        raise UserError(f"There are no .docx files in {folder}.")
+    return files, refused
+
+
+def scan_submission(path: Path, config: dict, entry: dict) -> Submission:
+    """Open one submitted sheet and read the roll number from it. Never raises."""
+    submission = Submission(path)
+    try:
+        document, repair_notes, submission.repaired = open_document(path)
+        submission.notes += repair_notes
+    except Exception as error:
+        submission.problem = f"could not be opened as a Word document ({type(error).__name__}: {error})"
+        return submission
+    try:
+        for declared in config["template_fields"]:
+            required = "column" in declared or bool(declared["value"].strip())
+            find_label_paragraph(document, declared["label"], required=required)
+        paragraph = find_label_paragraph(document, entry["label"])
+        submission.roll = read_field(paragraph, entry["label"], entry.get("where", "after-label"))
+        if config["marks_table"] is not None:
+            submission.marks = find_marks_table(document, config)[1]
+    except UserError as error:
+        submission.problem = f"does not match the expected sheet: {error}"
+        return submission
+    if not submission.roll:
+        submission.problem = f"the '{entry['label']}' {EMPTY_ROLL}"
+    return submission
+
+
+def same_value(a: str, b: str, column: str, config: dict) -> bool:
+    mobile = config.get("mobile_check")
+    if mobile and column == mobile["column"]:
+        return re.sub(r"\D", "", a) == re.sub(r"\D", "", b)
+    return squash(a) == squash(b)
+
+
+def complete_submission(submission: Submission, config: dict, output_path: Path,
+                        seal_path: Path | None = None) -> None:
+    """Add what the student's sheet is missing. What the student wrote is never overwritten."""
+    document = (Document(io.BytesIO(submission.repaired)) if submission.repaired is not None
+                else Document(submission.path))
+    font = font_settings(config)
+    student = submission.student
+    marks_header = config["columns"]["marks_obtained"]
+    roll_label = roll_entry(config)["label"]
+    for entry in config["template_fields"]:
+        label = entry["label"]
+        where = entry.get("where", "after-label")
+        paragraph = find_label_paragraph(document, label, required=False)
+        if paragraph is None:
+            continue
+        current = read_field(paragraph, label, where)
+        if entry.get("column") == marks_header:  # the program's own field
+            value = student.values[marks_header]
+            if value:
+                write_field(paragraph, entry, value, font)
+                if current and squash(current) != squash(value):
+                    submission.notes.append(f"'{label}' held '{current}', replaced with '{value}'")
+        elif "column" in entry:  # the student's own field
+            if label == roll_label:
+                continue
+            expected = student.values[entry["column"]]
+            if not current:
+                if expected:
+                    write_field(paragraph, entry, expected, font)
+                    submission.notes.append(f"'{label}' was blank, filled from the workbook")
+            elif expected and not same_value(current, expected, entry["column"], config):
+                submission.notes.append(
+                    f"'{label}' in the sheet is '{current}' but the workbook has '{expected}' (kept the sheet's)"
+                )
+        else:  # a fixed value: only fills a blank
+            value = expand(entry["value"], config).strip()
+            if value and not current:
+                write_field(paragraph, entry, value, font)
+    if submission.allocation:
+        populate_marks_awarded(document, config, submission.allocation, font)
+    if seal_path:
+        submission.seal = stamp_seal(document, seal_path, config)
+    document.save(output_path)
+
+
+def student_row(student: Student, marks_header: str, status: str, note: str = "", split: str = "",
+                seal: str = "", file: str = "") -> list:
+    return [student.roll, student.name, file, student.row, student.values.get(marks_header, ""),
+            split, status, seal, note]
+
+
+def write_submission_report(path: Path, submissions: list[Submission], extra_rows: list[list],
+                            marks_header: str) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Roll", "Name", "Submitted file", "Workbook row", "Marks obtained",
+                         "Question-wise marks", "Status", "Seal", "Notes"])
+        for item in submissions:
+            student = item.student
+            split = ""
+            if item.allocation and item.marks:
+                order = [q.label for q in item.marks.questions]
+                split = "; ".join(f"{l}={item.allocation[l]}" for l in order if l in item.allocation)
+            writer.writerow([
+                student.roll if student else item.roll, student.name if student else "", item.path.name,
+                student.row if student else "", student.values.get(marks_header, "") if student else "",
+                split, item.status or ("SKIPPED" if item.problem else ""), item.seal,
+                "; ".join(([item.problem] if item.problem else []) + item.notes)])
+        for row in extra_rows:
+            writer.writerow(row)
+
+
+def run_submissions(args: argparse.Namespace, config: dict, folder: Path, students: list[Student],
+                    warnings: list[str], input_fn: Callable[[str], str],
+                    template_path: Path | None = None) -> int:
+    entry = roll_entry(config)
+    files, refused = list_submission_files(folder)
+    info(f"Submissions: {len(files)} .docx file(s) in {folder}")
+    scanned = [scan_submission(path, config, entry) for path in files]
+
+    if all(item.problem.endswith(EMPTY_ROLL) for item in scanned):
+        raise UserError(
+            f"No roll number could be read from any of the {len(scanned)} sheet(s). If the students "
+            f"typed it in the cell to the right of '{entry['label']}', set \"where\": \"next-cell\" "
+            "on that entry in the config (see presets/ca2.json). Otherwise the sheets may use a "
+            "different label than the config expects."
+        )
+
+    by_key: dict[str, Student] = {}
+    for student in students:
+        by_key.setdefault(roll_key(student.roll), student)
+    groups: dict[str, list[Submission]] = {}
+    for item in scanned:
+        if item.problem:
+            continue
+        student = by_key.get(roll_key(item.roll))
+        if student is None:
+            item.problem = f"roll number '{item.roll}' is not in the workbook"
+            continue
+        item.student = student
+        groups.setdefault(roll_key(student.roll), []).append(item)
+    for group in groups.values():
+        if len(group) > 1:
+            names = ", ".join(item.path.name for item in group)
+            for item in group:
+                item.problem = (f"roll {group[0].student.roll} was submitted more than once ({names}); "
+                                "none of these files was used")
+
+    rules_path = (args.config.resolve().parent if args.config else HERE) / RULES_FILENAME
+    answers = [int(x) for x in args.answer.split(",")] if args.answer else None
+    layouts: dict[str, list[Submission]] = {}
+    for item in scanned:
+        if not item.problem and item.marks:
+            layouts.setdefault(item.marks.fingerprint, []).append(item)
+    sections_for: dict[str, list[Section] | None] = {}
+    for fingerprint, items in layouts.items():
+        marks = items[0].marks
+        if len(layouts) > 1:
+            info(f"\nAnother sheet layout was found in {len(items)} file(s), for example {items[0].path.name}.")
+        if args.check and answers is None and not load_rules(rules_path).get(fingerprint):
+            info("\nSection rules are not set for this layout yet; the next normal run will ask. "
+                 "Detected sections:")
+            show_sections(marks, detect_sections(marks.questions))
+            sections_for[fingerprint] = None
+            continue
+        try:
+            sections_for[fingerprint] = configure_sections(
+                marks, config, rules_path, items[0].path.name, answers=answers,
+                force_ask=args.ask_sections, save=not args.check, input_fn=input_fn)
+        except UserError as error:
+            for item in items:
+                item.problem = str(error)
+
+    for item in scanned:
+        if item.problem:
+            continue
+        sections = sections_for.get(item.marks.fingerprint) if item.marks else None
+        total = item.student.total
+        if total is not None and sections:
+            low, high = section_limits(item.marks.questions, sections)
+            if not low <= total <= high:
+                item.problem = (f"{total} marks cannot be split with exactly the required number of "
+                                f"answered questions (possible totals: {low} to {high})")
+                continue
+            item.allocation = allocate(total, item.marks, sections, item.student.roll)
+        item.stem = clean_filename(f"{item.student.roll}_{item.student.name}")
+
+    output_dir = args.output
+    make_pdf = not args.docx_only
+    ready = [item for item in scanned if not item.problem]
+    kept_existing = 0
+    for item in ready:
+        docx_path = output_dir / DOCX_FOLDER / f"{item.stem}.docx"
+        if docx_path.exists() and config["existing_files"] == "skip":
+            item.status = "kept existing"
+            kept_existing += 1
+    if kept_existing:
+        warnings.append(f"{kept_existing} file(s) already exist in the output folder and will be kept.")
+    warnings += refused
+
+    done_roll = {roll_key(item.student.roll) for item in ready}
+    # A file that could not even be read still tells us, by its name, which student sent it.
+    # This is only used to label the report; it never matches or fills anything.
+    by_file_name: dict[str, list[Submission]] = {}
+    for item in scanned:
+        if item.problem and item.student is None:
+            key = roll_key(re.split(r"[_\s]", item.path.stem, maxsplit=1)[0])
+            if key in by_key:
+                by_file_name.setdefault(key, []).append(item)
+    missing = [s for s in students if roll_key(s.roll) not in done_roll and roll_key(s.roll) not in groups]
+    unusable = [s for s in missing if roll_key(s.roll) in by_file_name]
+    sent_nothing = [s for s in missing if roll_key(s.roll) not in by_file_name]
+
+    # Students who sent no file at all get a sheet made from the template, if one was given.
+    generate_jobs: list[Job] = []
+    generate_skipped: list[str] = []
+    template_marks: MarksTable | None = None
+    if template_path is not None and sent_nothing:
+        try:
+            template_marks, template_warnings = analyse_template(template_path, config)
+            warnings += template_warnings
+            template_sections = None
+            if template_marks:
+                if args.check and answers is None and not load_rules(rules_path).get(template_marks.fingerprint):
+                    info("\nSection rules are not set for the template yet; the next normal run will ask. "
+                         "Detected sections:")
+                    show_sections(template_marks, detect_sections(template_marks.questions))
+                else:
+                    template_sections = configure_sections(
+                        template_marks, config, rules_path, template_path.name, answers=answers,
+                        force_ask=args.ask_sections, save=not args.check, input_fn=input_fn)
+            planning = {**config, "unreachable_marks": "skip"}  # a total that cannot be split is skipped
+            generate_jobs, plan_problems, generate_skipped = plan_jobs(
+                sent_nothing, template_marks if template_sections else None, template_sections,
+                output_dir, planning, make_pdf)
+            warnings += plan_problems
+        except UserError as error:
+            warnings.append(f"Sheets could not be made from the template ({error}); "
+                            "the students who sent nothing are listed instead.")
+            generate_jobs, generate_skipped = [], []
+    if warnings:
+        report_problems("Warnings", warnings)
+    generating = {job.student.roll for job in generate_jobs}
+
+    if args.check:
+        if args.seal:
+            for message in check_seal_image(args.seal):
+                info(f"  Seal warning: {message}")
+            info(f"The seal image {args.seal.name} can be used.")
+        info(f"\nCheck finished: {len(ready)} submitted sheet(s) could be completed, "
+             f"{sum(1 for i in scanned if i.problem)} file(s) would be skipped, "
+             f"{len(unusable)} student(s) sent a file that cannot be used, "
+             f"{len(sent_nothing)} sent nothing"
+             + (f" ({len(generate_jobs)} would be made from the template)." if template_path else ".")
+             + " No files were written.")
+        for item in scanned:
+            if item.problem:
+                info(f"  skipped {item.path.name}: {item.problem}")
+        return 0
+
+    to_complete = [item for item in ready if item.status != "kept existing"]
+    to_generate = [job for job in generate_jobs if job.write_docx]
+    seal_path, seal_warnings = choose_seal(args, len(to_complete) + len(to_generate), input_fn)
+    if seal_warnings:
+        report_problems("Warnings about the seal image", seal_warnings)
+    (output_dir / DOCX_FOLDER).mkdir(parents=True, exist_ok=True)
+    if make_pdf:
+        (output_dir / PDF_FOLDER).mkdir(parents=True, exist_ok=True)
+    info(f"\nCompleting {len(ready)} submitted sheet(s)...")
+    written: list[Submission] = []
+    for item in ready:
+        if item.status == "kept existing":
+            continue
+        try:
+            complete_submission(item, config, output_dir / DOCX_FOLDER / f"{item.stem}.docx", seal_path)
+            item.status = "completed"
+            written.append(item)
+        except Exception as error:
+            item.problem = f"could not be completed ({type(error).__name__}: {error})"
+
+    generated: list[Job] = []
+    if to_generate:
+        info(f"Making {len(to_generate)} sheet(s) from the template for students who sent nothing...")
+    for job in to_generate:
+        try:
+            job.seal = create_docx(template_path, job.student, job.allocation, job.docx_path, config, seal_path)
+            job.status = "generated"
+            generated.append(job)
+        except Exception as error:
+            job.status = "failed"
+            job.notes.append(f"{type(error).__name__}: {error}")
+
+    pdf_failures: list[str] = []
+    if make_pdf:
+        pairs = [(output_dir / DOCX_FOLDER / f"{i.stem}.docx", output_dir / PDF_FOLDER / f"{i.stem}.pdf")
+                 for i in written]
+        pairs += [(job.docx_path, job.pdf_path) for job in generated if job.write_pdf]
+        pdf_failures = export_pdfs(pairs, args.pdf_engine, args.soffice)
+
+    skipped = [item for item in scanned if item.problem]
+    differences = [(i, n) for i in scanned if not i.problem for n in i.notes if "workbook has" in n]
+    filled = [(i, n) for i in scanned if not i.problem for n in i.notes if "was blank" in n]
+    replaced = [(i, n) for i in scanned if not i.problem for n in i.notes if "replaced with" in n]
+    repaired = [(i, n) for i in scanned if not i.problem for n in i.notes if "wrong checksum" in n]
+
+    # --- rows for the students who have no completed submitted sheet
+    marks_header = config["columns"]["marks_obtained"]
+    signature_on = config["signature"]["enabled"]
+    order = [q.label for q in template_marks.questions] if template_marks else []
+    extra: list[list] = []
+    for student in unusable:
+        names = ", ".join(i.path.name for i in by_file_name[roll_key(student.roll)])
+        reasons = "; ".join(i.problem for i in by_file_name[roll_key(student.roll)])
+        extra.append(student_row(student, marks_header, "FILE RECEIVED, NOT USED",
+                                 f"a file named {names} was received but could not be used ({reasons})"))
+    job_for = {job.student.roll: job for job in generate_jobs}
+    for student in sent_nothing:
+        job = job_for.get(student.roll)
+        if job is None:
+            message = next((m for m in generate_skipped if f"(roll {student.roll}," in m), "")
+            if message:
+                extra.append(student_row(student, marks_header, "NO SUBMISSION", f"not made from the template: {message}"))
+            else:
+                extra.append(student_row(student, marks_header, "NO SUBMISSION"))
+            continue
+        split = "; ".join(f"{l}={job.allocation[l]}" for l in order if job.allocation and l in job.allocation)
+        if job.status == "generated":
+            label = "GENERATED (typed signature)" if signature_on else "GENERATED (no signature)"
+            note = ("no sheet was submitted; made from the template with a typed (generated) signature"
+                    if signature_on else "no sheet was submitted; made from the template without a signature")
+            extra.append(student_row(student, marks_header, label, note, split, job.seal))
+        elif job.status == "failed":
+            extra.append(student_row(student, marks_header, "GENERATION FAILED", "; ".join(job.notes)))
+        else:
+            extra.append(student_row(student, marks_header, "kept existing", "no sheet was submitted; the "
+                                     "sheet made earlier from the template was kept", split))
+    write_submission_report(output_dir / REPORT_FILENAME, scanned, extra, marks_header)
+
+    # --- what the person sees
+    info(f"\nCompleted: {len(written)} submitted sheet(s)" + (f", kept existing: {kept_existing}" if kept_existing else ""))
+    if template_path is not None:
+        info(f"Made from the template for students who sent nothing: {len(generated)}"
+             + (f" ({'typed signature' if signature_on else 'no signature'})" if generated else ""))
+    if seal_path:
+        stamped = sum(1 for i in written if i.seal == "stamped") + sum(1 for j in generated if j.seal == "stamped")
+        info(f"Seal: stamped on {stamped} of {len(written) + len(generated)} sheet(s) ({seal_path.name}).")
+        had = [i.path.name for i in written if i.seal == "already had a seal"] + \
+              [j.docx_path.name for j in generated if j.seal == "already had a seal"]
+        if had:
+            report_problems("Sheets that already had a seal (not stamped again)", had)
+    if repaired:
+        report_problems("Sheets completed after recovering a picture with a wrong checksum (please look at them)",
+                        [f"{i.path.name}: {n}" for i, n in repaired])
+    if skipped:
+        report_problems("Files that were not used", [f"{i.path.name}: {i.problem}" for i in skipped])
+        if any("is not in the workbook" in i.problem for i in skipped):
+            info("  Tip: if those roll numbers belong to students who should be on the list, add them to the "
+                 "workbook and run again with --existing skip, so only the new sheets are made.")
+    if unusable:
+        report_problems("Students who sent a file that could not be used",
+                        [f"{s.roll} {s.name}: {', '.join(i.path.name for i in by_file_name[roll_key(s.roll)])}"
+                         for s in unusable])
+    if generated:
+        listed = [f"{j.student.roll} {j.student.name}" for j in generated[:30]]
+        if len(generated) > 30:
+            listed.append(f"... and {len(generated) - 30} more (see {REPORT_FILENAME})")
+        report_problems("Sheets made from the template (no sheet was submitted)", listed)
+    failed = [j for j in generate_jobs if j.status == "failed"]
+    if failed:
+        report_problems("Sheets that could not be made from the template",
+                        [f"{j.student.roll} {j.student.name}: {'; '.join(j.notes)}" for j in failed])
+    not_made = [s for s in sent_nothing if s.roll not in generating]
+    if not_made:
+        listed = [f"{s.roll} {s.name}" for s in not_made[:30]]
+        if len(not_made) > 30:
+            listed.append(f"... and {len(not_made) - 30} more (see {REPORT_FILENAME})")
+        report_problems("Students in the workbook with no sheet", listed)
+    if differences:
+        report_problems("Details in the sheet that differ from the workbook (the sheet's text was kept)",
+                        [f"{i.path.name}: {n}" for i, n in differences])
+    if filled:
+        report_problems("Blank fields filled from the workbook", [f"{i.path.name}: {n}" for i, n in filled])
+    if replaced:
+        report_problems("Marks fields that already held text (replaced)", [f"{i.path.name}: {n}" for i, n in replaced])
+    for message in pdf_failures:
+        info(f"  PDF problem: {message}")
+    info(f"\nFiles are in: {output_dir}\nRun report: {output_dir / REPORT_FILENAME}")
+    return 1 if skipped or pdf_failures or failed else 0
+
+
+# --------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------
 
@@ -1417,11 +2152,63 @@ def choose_input_file(label: str, suffixes: tuple[str, ...]) -> Path:
     return Path(selected)
 
 
+def choose_folder(label: str) -> Path:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    selected = filedialog.askdirectory(title=f"Select the {label}")
+    root.destroy()
+    if not selected:
+        raise UserError(f"No {label} was selected.")
+    return Path(selected)
+
+
+def choose_sources(args: argparse.Namespace, input_fn: Callable[[str], str]) -> tuple[Path | None, Path | None]:
+    """Returns (submissions folder, template).
+
+    Alone, a template means "generate new sheets". Together with a submissions folder it is used
+    only for the students who sent no sheet.
+    """
+    if args.submissions:
+        return args.submissions, args.template
+    if args.template:
+        return None, args.template
+    info("\nWhat would you like to do?")
+    info("  1. Generate new sheets from a template")
+    info("  2. Complete sheets that students have filled in")
+    try:
+        reply = input_fn("Choose 1 or 2 [1]: ").strip()
+    except EOFError:
+        reply = ""
+    if reply != "2":
+        return None, choose_input_file("top sheet template", (".docx",))
+    folder = choose_folder("folder of the students' filled-in sheets")
+    try:
+        answer = input_fn("For students who sent no sheet, make one from a template? [y/N]: ")
+    except EOFError:
+        answer = ""
+    template = None
+    if answer.strip().casefold() in {"y", "yes"}:
+        try:
+            template = choose_input_file("top sheet template (for students who sent no sheet)", (".docx",))
+        except UserError:
+            info("No template was chosen, so students who sent no sheet will only be listed.")
+    return folder, template
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create one completed CA1 top sheet per student.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--workbook", type=Path, help="Excel workbook with the student data")
-    parser.add_argument("--template", type=Path, help="Word top-sheet template")
+    parser.add_argument("--template", type=Path,
+                        help="Word top-sheet template (to generate new sheets; together with --submissions "
+                             "it is used for the students who sent no sheet)")
+    parser.add_argument("--submissions", type=Path,
+                        help="Folder of sheets filled in by students; they are completed instead of "
+                             "generating new sheets (use instead of --template)")
     parser.add_argument("--sheet", help="Worksheet name (default: the active sheet)")
     parser.add_argument("--output", type=Path, default=Path("output"), help="Output folder")
     parser.add_argument("--config", type=Path, help="Config file (default: config.json beside the script)")
@@ -1431,6 +2218,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Create DOCX files only, no PDFs")
     parser.add_argument("--check", action="store_true",
                         help="Validate everything and report; write no files")
+    parser.add_argument("--seal", type=Path,
+                        help="Image of the official seal to stamp on every sheet (PNG with a transparent "
+                             "background is best). Without it, an interactive run asks whether to stamp one")
     parser.add_argument("--no-prompt", action="store_true",
                         help="Do not show the settings screen; use config.json and config.local.json as they are")
     parser.add_argument("--ask-sections", action="store_true",
@@ -1485,13 +2275,17 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     explicit = set(read_local_config(args.config)) | apply_overrides(config, args)
 
     workbook_path = args.workbook or choose_input_file("student data workbook", (".xlsx", ".xlsm"))
-    template_path = args.template or choose_input_file("top sheet template", (".docx",))
-    for label, path in (("workbook", workbook_path), ("template", template_path)):
-        if not path.is_file():
-            raise UserError(f"The {label} file was not found: {path}")
+    submissions_dir, template_path = choose_sources(args, input_fn)
+    if not workbook_path.is_file():
+        raise UserError(f"The workbook file was not found: {workbook_path}")
+    if template_path is not None and not template_path.is_file():
+        raise UserError(f"The template file was not found: {template_path}")
+    if submissions_dir is not None and not submissions_dir.is_dir():
+        raise UserError(f"The submissions folder was not found: {submissions_dir}")
 
     # Full marks: offer the number the template itself states, unless the user has set one.
-    stated = read_template_full_marks(open_template(template_path), config.get("full_marks_label"))
+    stated = (read_template_full_marks(open_template(template_path), config.get("full_marks_label"))
+              if template_path is not None else None)
     from_template = False
     if stated is not None and "full_marks" not in explicit and stated != config["full_marks"]:
         config["full_marks"] = stated
@@ -1515,7 +2309,7 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     info(f"Workbook: {workbook_path.name} - {len(students)} student row(s) read.")
     students, duplicate_notes, conflicts = resolve_duplicates(students, config["duplicates"])
     warnings = notes + duplicate_notes
-    if not config["exam_date"].strip():
+    if submissions_dir is None and not config["exam_date"].strip():
         warnings.append(
             "The exam date is empty, so 'Date of Examination' and the date under the signature "
             "are left blank. Set it on the settings screen or with --exam-date."
@@ -1524,6 +2318,9 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     data_errors, data_warnings = validate_students(students, config)
     errors += data_errors
     warnings += data_warnings
+
+    if submissions_dir is not None:
+        return run_submissions(args, config, submissions_dir, students, warnings, input_fn, template_path)
 
     marks, template_warnings = analyse_template(template_path, config)
     warnings += template_warnings
@@ -1574,8 +2371,16 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     info(f"\nReady: {len(jobs)} sheet(s), {absent} absent. Font mode: {config['font_mode']}. "
          f"Exam date: {config['exam_date'] or '(blank)'}.")
     if args.check:
+        if args.seal:
+            for message in check_seal_image(args.seal):
+                info(f"Seal warning: {message}")
+            info(f"The seal image {args.seal.name} can be used.")
         info("Check finished; no files were written.")
         return 0
+
+    seal_path, seal_warnings = choose_seal(args, sum(1 for j in jobs if j.write_docx), input_fn)
+    if seal_warnings:
+        report_problems("Warnings about the seal image", seal_warnings)
 
     (output_dir / DOCX_FOLDER).mkdir(parents=True, exist_ok=True)
     if make_pdf:
@@ -1585,13 +2390,17 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     failures: dict[str, str] = {}
     if to_write:
         info(f"Creating {len(to_write)} DOCX file(s) with {args.workers} worker(s)...")
-        work = [(str(template_path), j.student, j.allocation, str(j.docx_path), config) for j in to_write]
+        work = [(str(template_path), j.student, j.allocation, str(j.docx_path), config,
+                 str(seal_path) if seal_path else None) for j in to_write]
         if args.workers > 1 and len(work) > 1:
             with ProcessPoolExecutor(max_workers=args.workers) as pool:
                 results = list(pool.map(docx_job, work))
         else:
             results = [docx_job(item) for item in work]
-        failures = {roll: message for roll, message in results if message}
+        failures = {roll: message for roll, message, _ in results if message}
+        seal_outcome = {roll: outcome for roll, _, outcome in results}
+        for job in to_write:
+            job.seal = seal_outcome.get(job.student.roll, "")
         for roll, message in failures.items():
             info(f"  FAILED roll {roll}: {message}")
 
@@ -1608,6 +2417,12 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
                  warnings + [f"PDF problem: {m}" for m in pdf_failures],
                  config["columns"]["marks_obtained"])
     info(f"\nDone. Files are in: {output_dir}")
+    if seal_path:
+        info(f"Seal: stamped on {sum(1 for j in to_write if j.seal == 'stamped')} of {len(to_write)} sheet(s) "
+             f"({seal_path.name}).")
+        had = [j for j in to_write if j.seal == "already had a seal"]
+        if had:
+            report_problems("Sheets that already had a seal (not stamped again)", [j.docx_path.name for j in had])
     info(f"Run report: {report_path}")
     return 1 if failures or pdf_failures else 0
 
