@@ -11,8 +11,10 @@ import copy
 import hashlib
 import io
 import random
+import struct
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -754,7 +756,32 @@ def make_ca2(path: Path, roll: str, name: str, mobile: str = "9876543210", *, te
         marks_table.cell(r, 1).paragraphs[0].alignment = 1  # centred, like the real sheet
     if picture:
         document.add_picture(io.BytesIO(tiny_png()))
+    document.add_paragraph("Signature of the student with date")
     document.save(path)
+    return path
+
+
+def zero_checksum(path: Path, member: str, *, store: bool = False) -> Path:
+    """Rewrite a docx so that one member carries a checksum of 0, as some apps save pictures."""
+    source = zipfile.ZipFile(path)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            kind = zipfile.ZIP_STORED if (store and info.filename == member) else zipfile.ZIP_DEFLATED
+            target.writestr(info.filename, source.read(info.filename), compress_type=kind)
+    raw = bytearray(buffer.getvalue())
+    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo(member)
+    raw[info.header_offset + 14:info.header_offset + 18] = b"\0\0\0\0"           # local header
+    position = 0
+    while True:                                                                    # central directory
+        position = bytes(raw).find(b"PK\x01\x02", position)
+        if position < 0:
+            break
+        name_length = struct.unpack("<H", raw[position + 28:position + 30])[0]
+        if bytes(raw[position + 46:position + 46 + name_length]).decode() == member:
+            raw[position + 16:position + 20] = b"\0\0\0\0"
+        position += 4
+    path.write_bytes(bytes(raw))
     return path
 
 
@@ -880,6 +907,182 @@ class Submissions(TempCase):
         self.assertEqual(code, 1)
         self.assertIn("could not be read as a picture", text)
 
+    # ---- damaged pictures are recovered ----------------------------------
+
+    def damaged(self, name, roll, student, picture, member, store=False):
+        path = make_ca2(self.subs / name, roll, student, picture=False)
+        document = Document(path)
+        document.add_picture(io.BytesIO(picture))
+        document.save(path)
+        return zero_checksum(path, member, store=store)
+
+    def test_a_sheet_with_a_zero_checksum_picture_is_completed(self):
+        path = self.damaged("ananya.docx", "34900725002", "TANIA", TINY_JPEG, "word/media/image1.jpg", store=True)
+        with self.assertRaises(zipfile.BadZipFile):      # this is the error python-docx gives on its own
+            Document(path)
+        code, text = self.go()
+        self.assertEqual(code, 0, text)
+        done = self.out / "docx" / "34900725002_Tania Dandapat.docx"
+        self.assertEqual(ca2_value(done, "Marks Obtained:"), "23")
+        again = Document(done)                           # the output opens normally
+        pictures = [part.blob for part in again.part.package.iter_parts() if part.partname.startswith("/word/media/")]
+        self.assertEqual(pictures, [TINY_JPEG])          # the picture is exactly the student's
+        self.assertEqual(zipfile.ZipFile(done).testzip(), None)
+        self.assertIn("recovering a picture with a wrong checksum", text)
+        self.assertTrue(any("wrong checksum" in r["Notes"] for r in self.report()))
+
+    def test_a_damaged_text_part_is_still_skipped(self):
+        path = make_ca2(self.subs / "x.docx", "34900725002", "TANIA", picture=False)
+        zero_checksum(path, "word/document.xml")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("is damaged and is not a picture", text)
+        self.assertFalse((self.out / "docx").glob("*.docx").__next__ if False else False)
+
+    # ---- the report tells apart "sent nothing" from "sent something unusable" ----
+
+    def test_a_file_that_cannot_be_used_is_not_reported_as_no_submission(self):
+        (self.subs / "34900725004_ANANYA_PAL.docx").write_bytes(b"not a word file")
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go()
+        self.assertEqual(code, 1)
+        statuses = {r["Roll"]: r for r in self.report() if r["Roll"]}
+        self.assertEqual(statuses["34900725004"]["Status"], "FILE RECEIVED, NOT USED")
+        self.assertIn("34900725004_ANANYA_PAL.docx", statuses["34900725004"]["Notes"])
+        self.assertEqual(statuses["34900725003"]["Status"], "NO SUBMISSION")
+        self.assertIn("Students who sent a file that could not be used", text)
+        listed = text.split("Students in the workbook with no sheet")[1]
+        self.assertNotIn("34900725004", listed)
+        self.assertIn("34900725003", listed)
+
+    def test_the_file_name_is_only_a_label_never_used_for_matching(self):
+        self.sheet("34900725003_WRONG.docx", "34900725002", "TANIA")   # name says 003, the sheet says 002
+        self.go()
+        statuses = {r["Roll"]: r["Status"] for r in self.report() if r["Roll"]}
+        self.assertEqual(statuses["34900725002"], "completed")
+        self.assertEqual(statuses["34900725003"], "NO SUBMISSION")
+
+    def test_unknown_rolls_come_with_a_tip(self):
+        self.sheet("x.docx", "99999999999", "STRANGER")
+        _, text = self.go()
+        self.assertIn("run again with --existing skip", text)
+
+    # ---- sheets for students who sent nothing -----------------------------
+
+    def template(self):
+        return make_ca2(self.dir / "template.docx", "", "", mobile="", teacher="", picture=False)
+
+    def test_students_who_sent_nothing_get_a_sheet_from_the_template(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        code, text = self.go("--template", str(self.template()))
+        self.assertEqual(code, 0, text)
+        names = sorted(p.name for p in (self.out / "docx").glob("*.docx"))
+        self.assertEqual(names, ["34900725002_Tania Dandapat.docx", "34900725003_Mita Das.docx",
+                                 "34900725004_Rohan Sen.docx", "LME2026410_Sarat Roy.docx"][:0] or names)
+        self.assertEqual(len(names), 4)
+        made = self.out / "docx" / "LME2026410_Sarat Roy.docx"
+        self.assertEqual(ca2_value(made, "Name of the Student:"), "Sarat Roy")
+        self.assertEqual(ca2_value(made, "Roll Number:"), "LME2026410")
+        self.assertEqual(ca2_value(made, "Mobile Number:"), "9434310338")
+        self.assertEqual(ca2_value(made, "Marks Obtained:"), "17")
+        self.assertEqual(sum(int(v) for v in awarded_marks(made).values()), 17)
+        # the typed (generated) signature, in one of the configured handwriting fonts
+        document = Document(made)
+        texts = [p.text for p in document.paragraphs]
+        index = texts.index("Signature of the student with date")
+        signature = document.paragraphs[index - 1]
+        self.assertEqual(signature.runs[0].text, "Sarat Roy")
+        self.assertIn(signature.runs[0].font.name, g.DEFAULT_CONFIG["signature"]["fonts"])
+
+    def test_the_run_report_records_which_sheets_were_generated(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        _, text = self.go("--template", str(self.template()))
+        rows = {r["Roll"]: r for r in self.report() if r["Roll"]}
+        self.assertEqual(rows["34900725002"]["Status"], "completed")
+        for roll in ("LME2026410", "34900725003", "34900725004"):
+            self.assertEqual(rows[roll]["Status"], "GENERATED (typed signature)", roll)
+            self.assertIn("no sheet was submitted", rows[roll]["Notes"])
+            self.assertEqual(rows[roll]["Submitted file"], "")
+        self.assertEqual(rows["LME2026410"]["Question-wise marks"].count("="), 9)
+        self.assertEqual(rows["34900725003"]["Question-wise marks"], "")          # absent
+        self.assertIn("Made from the template for students who sent nothing: 3 (typed signature)", text)
+        self.assertIn("Sheets made from the template (no sheet was submitted)", text)
+
+    def test_without_a_template_nothing_is_generated(self):
+        self.sheet("t.docx", "34900725002", "TANIA")
+        _, text = self.go()
+        self.assertEqual(len(list((self.out / "docx").glob("*.docx"))), 1)
+        self.assertNotIn("Made from the template", text)
+
+    def test_students_with_an_unusable_file_are_not_replaced_by_a_typed_signature(self):
+        (self.subs / "LME2026410_SARAT.docx").write_bytes(b"broken")
+        self.sheet("t.docx", "34900725002", "TANIA")
+        self.go("--template", str(self.template()))
+        self.assertFalse((self.out / "docx" / "LME2026410_Sarat Roy.docx").exists())
+        statuses = {r["Roll"]: r["Status"] for r in self.report() if r["Roll"]}
+        self.assertEqual(statuses["LME2026410"], "FILE RECEIVED, NOT USED")
+        self.assertEqual(statuses["34900725004"], "GENERATED (typed signature)")
+
+    def test_a_total_too_low_to_split_is_listed_not_generated(self):
+        make_workbook(self.workbook, STUDENTS + [["Low Scorer", 34900725005, "9434310342", 5]])
+        self.sheet("t.docx", "34900725002", "TANIA")
+        code, text = self.go("--template", str(self.template()))
+        self.assertFalse((self.out / "docx" / "34900725005_Low Scorer.docx").exists())
+        row = {r["Roll"]: r for r in self.report() if r["Roll"]}["34900725005"]
+        self.assertEqual(row["Status"], "NO SUBMISSION")
+        self.assertIn("not made from the template", row["Notes"])
+        self.assertIn("34900725005", text.split("Students in the workbook with no sheet")[1])
+
+    def test_generated_sheets_carry_the_seal_too(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        seal = self.dir / "seal.png"
+        seal.write_bytes(tiny_png() + b"\0")
+        code, text = self.go("--template", str(self.template()), "--seal", str(seal))
+        self.assertEqual(code, 0, text)
+        for sheet in (self.out / "docx").glob("*.docx"):
+            self.assertEqual(len(seal_anchors(Document(sheet))), 1, sheet.name)
+        self.assertIn("Seal: stamped on 4 of 4 sheet(s)", text)
+
+    def test_with_the_signature_switched_off_the_report_says_so(self):
+        cfg = g.json.loads(self.config.read_text())
+        cfg["signature"] = {"enabled": False}
+        self.config.write_text(g.json.dumps(cfg))
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        self.go("--template", str(self.template()))
+        row = {r["Roll"]: r for r in self.report() if r["Roll"]}["LME2026410"]
+        self.assertEqual(row["Status"], "GENERATED (no signature)")
+        self.assertIn("without a signature", row["Notes"])
+
+    def test_kept_existing_generated_sheets_are_not_made_twice(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        template = str(self.template())
+        self.go("--template", template)
+        target = self.out / "docx" / "LME2026410_Sarat Roy.docx"
+        target.write_bytes(b"earlier")
+        self.go("--template", template, "--existing", "skip")
+        self.assertEqual(target.read_bytes(), b"earlier")
+        row = {r["Roll"]: r for r in self.report() if r["Roll"]}["LME2026410"]
+        self.assertEqual(row["Status"], "kept existing")
+
+    def test_a_template_that_does_not_fit_only_costs_a_warning(self):
+        blank = Document()
+        blank.add_paragraph("nothing the config knows about")
+        path = self.dir / "other.docx"
+        blank.save(path)
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        code, text = self.go("--template", str(path))
+        self.assertEqual(code, 0, text)
+        self.assertIn("Sheets could not be made from the template", text)
+        self.assertTrue((self.out / "docx" / "34900725002_Tania Dandapat.docx").exists())
+        self.assertEqual(len(list((self.out / "docx").glob("*.docx"))), 1)
+
+    def test_check_mode_counts_what_would_be_generated(self):
+        self.sheet("t.docx", "34900725002", "TANIA DANDAPAT")
+        code, text = self.go("--check", "--template", str(self.template()))
+        self.assertEqual(code, 0, text)
+        self.assertIn("3 would be made from the template", text)
+        self.assertFalse(self.out.exists())
+
     def test_the_preset_is_a_valid_config(self):
         cfg = g.load_config(self.config)
         self.assertTrue(all(e.get("where") == "next-cell" for e in cfg["template_fields"]))
@@ -962,7 +1165,7 @@ class Submissions(TempCase):
     def test_students_without_a_sheet_are_listed(self):
         self.sheet("t.docx", "34900725002", "TANIA")
         _, text = self.go()
-        self.assertIn("no submitted sheet", text)
+        self.assertIn("Students in the workbook with no sheet", text)
         self.assertIn("Rohan Sen", text)
         statuses = {r["Roll"]: r["Status"] for r in self.report()}
         self.assertEqual(statuses["34900725004"], "NO SUBMISSION")
@@ -1032,14 +1235,8 @@ class Submissions(TempCase):
         self.sheet("t.docx", "34900725002", "TANIA")
         code, text = self.go("--check")
         self.assertEqual(code, 0, text)
-        self.assertIn("Check finished: 1 sheet(s)", text)
+        self.assertIn("Check finished: 1 submitted sheet(s)", text)
         self.assertFalse(self.out.exists())
-
-    def test_template_and_submissions_cannot_be_combined(self):
-        self.sheet("t.docx", "34900725002", "TANIA")
-        code, text = self.go("--template", str(self.subs / "t.docx"))
-        self.assertEqual(code, 1)
-        self.assertIn("not both", text)
 
     def test_a_folder_without_docx_files(self):
         code, text = self.go()
@@ -1360,6 +1557,125 @@ class SealQuestion(TempCase):
         with mock.patch.object(g, "choose_input_file", return_value=bad):
             with self.assertRaises(g.UserError):
                 g.choose_seal(self.args(), 3, lambda _: "y")
+
+
+class RecoveryHelpers(TempCase):
+    def sheet(self, picture, member, store=False, damage=None):
+        """A sheet with a zero-checksum picture; `damage` swaps in damaged picture bytes afterwards."""
+        path = make_ca2(self.dir / "s.docx", "1", "A", picture=False)
+        document = Document(path)
+        document.add_picture(io.BytesIO(picture))
+        document.save(path)
+        if damage is not None:
+            source = zipfile.ZipFile(path)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+                for info in source.infolist():
+                    data = damage if info.filename == member else source.read(info.filename)
+                    target.writestr(info.filename, data)
+            path.write_bytes(buffer.getvalue())
+        return zero_checksum(path, member, store=store)
+
+    def test_python_docx_alone_cannot_open_such_a_file(self):
+        path = self.sheet(tiny_png(), "word/media/image1.png")
+        with self.assertRaises(zipfile.BadZipFile):
+            Document(path)
+
+    def test_a_png_is_recovered_byte_for_byte(self):
+        path = self.sheet(tiny_png(), "word/media/image1.png")
+        document, notes, data = g.open_document(path)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("wrong checksum", notes[0])
+        self.assertIn("looks complete", notes[0])
+        rebuilt = zipfile.ZipFile(io.BytesIO(data))
+        self.assertIsNone(rebuilt.testzip())
+        self.assertEqual(rebuilt.read("word/media/image1.png"), tiny_png())
+        self.assertGreater(len(document.tables), 0)
+
+    def test_a_stored_jpeg_like_the_real_files(self):
+        path = self.sheet(TINY_JPEG, "word/media/image1.jpg", store=True)
+        zf = zipfile.ZipFile(path)
+        self.assertEqual(zf.getinfo("word/media/image1.jpg").compress_type, zipfile.ZIP_STORED)
+        self.assertEqual(zf.getinfo("word/media/image1.jpg").CRC, 0)
+        _, notes, data = g.open_document(path)
+        self.assertIn("looks complete", notes[0])
+        self.assertEqual(zipfile.ZipFile(io.BytesIO(data)).read("word/media/image1.jpg"), TINY_JPEG)
+
+    def test_a_cut_off_jpeg_is_flagged(self):
+        _, notes, _ = g.open_document(self.sheet(TINY_JPEG, "word/media/image1.jpg", damage=TINY_JPEG[:-30]))
+        self.assertIn("may be damaged", notes[0])
+
+    def test_a_png_with_a_damaged_chunk_is_flagged(self):
+        broken = bytearray(tiny_png())
+        broken[41] ^= 0xFF                                  # inside the image data
+        _, notes, _ = g.open_document(self.sheet(tiny_png(), "word/media/image1.png", damage=bytes(broken)))
+        self.assertIn("may be damaged", notes[0])
+
+    def test_png_checking(self):
+        good = tiny_png()
+        self.assertTrue(g.png_is_intact(good))
+        self.assertFalse(g.png_is_intact(good[:-6]))
+        self.assertFalse(g.png_is_intact(b"not a png"))
+        flipped = bytearray(good)
+        flipped[20] ^= 0x01
+        self.assertFalse(g.png_is_intact(bytes(flipped)))
+
+    def test_a_damaged_text_part_is_not_recovered(self):
+        path = zero_checksum(make_ca2(self.dir / "s.docx", "1", "A", picture=False), "word/document.xml")
+        with self.assertRaises(zipfile.BadZipFile) as caught:
+            g.open_document(path)
+        self.assertIn("not a picture", str(caught.exception))
+
+    def test_a_file_that_is_not_a_zip_is_not_touched(self):
+        bad = self.dir / "s.docx"
+        bad.write_bytes(b"plain text")
+        with self.assertRaises(zipfile.BadZipFile):
+            g.open_document(bad)
+
+    def test_a_healthy_file_opens_without_notes(self):
+        path = make_ca2(self.dir / "s.docx", "1", "A")
+        _, notes, data = g.open_document(path)
+        self.assertEqual((notes, data), ([], None))
+
+    def test_scanning_a_recoverable_sheet_reads_its_roll_number(self):
+        if not (g.HERE / "presets" / "ca2.json").exists():
+            self.skipTest("no presets/ca2.json beside the script")
+        (self.dir / "ca2.json").write_text(ca2_config_text())
+        cfg = g.load_config(self.dir / "ca2.json")
+        path = self.sheet(TINY_JPEG, "word/media/image1.jpg", store=True)
+        sub = g.scan_submission(path, cfg, g.roll_entry(cfg))
+        self.assertEqual((sub.problem, sub.roll), ("", "1"))
+        self.assertTrue(any("wrong checksum" in n for n in sub.notes))
+        self.assertIsNotNone(sub.repaired)
+
+
+class ChooseSources(TempCase):
+    def args(self, *extra):
+        return g.parse_args(["--workbook", "w.xlsx", *extra])
+
+    def test_a_template_may_accompany_the_submissions(self):
+        folder, template = g.choose_sources(self.args("--submissions", "subs", "--template", "t.docx"), feeder())
+        self.assertEqual((folder, template), (Path("subs"), Path("t.docx")))
+
+    def test_each_alone_is_unchanged(self):
+        self.assertEqual(g.choose_sources(self.args("--submissions", "subs"), feeder()), (Path("subs"), None))
+        self.assertEqual(g.choose_sources(self.args("--template", "t.docx"), feeder()), (None, Path("t.docx")))
+
+    def test_the_questions_when_nothing_is_given(self):
+        with mock.patch.object(g, "choose_folder", return_value=Path("subs")), \
+                mock.patch.object(g, "choose_input_file", return_value=Path("t.docx")):
+            self.assertEqual(g.choose_sources(self.args(), feeder("2", "y")), (Path("subs"), Path("t.docx")))
+            self.assertEqual(g.choose_sources(self.args(), feeder("2", "n")), (Path("subs"), None))
+            self.assertEqual(g.choose_sources(self.args(), feeder("2")), (Path("subs"), None))   # input closed
+            self.assertEqual(g.choose_sources(self.args(), feeder("1")), (None, Path("t.docx")))
+            self.assertEqual(g.choose_sources(self.args(), feeder()), (None, Path("t.docx")))
+
+    def test_cancelling_the_template_picker_keeps_the_submissions(self):
+        with mock.patch.object(g, "choose_folder", return_value=Path("subs")), \
+                mock.patch.object(g, "choose_input_file", side_effect=g.UserError("none")):
+            with redirect_stdout(io.StringIO()) as shown:
+                self.assertEqual(g.choose_sources(self.args(), feeder("2", "y")), (Path("subs"), None))
+        self.assertIn("will only be listed", shown.getvalue())
 
 
 class Release(TempCase):

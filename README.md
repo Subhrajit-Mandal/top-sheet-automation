@@ -95,6 +95,23 @@ For every `.docx` in the folder the program:
 
 The summary at the end also lists the students in the workbook who have **no** submitted sheet, the details that differ from the workbook, and the blank fields that were filled. All of it is in `run_report.csv` too.
 
+**Damaged pictures are recovered.** Some apps save a picture inside the Word file with no checksum (a checksum of zero). The picture is fine, but Python refuses to open the file (`Bad CRC-32 for file 'word/media/image1.jpeg'`). The program rebuilds a clean copy in memory, reading each such picture exactly as it is, completes the sheet normally, and lists it under **Sheets completed after recovering a picture** so you can look at it. JPEGs are checked for a proper start and end, PNGs against their own built-in checksums; the note says whether the picture "looks complete" or "may be damaged". Only pictures are recovered. If a text part of the file has a bad checksum, the file is skipped, so a student's typed details are never silently corrupted.
+
+**A file that cannot be used is not "no submission".** The report marks a student whose file could not be used as `FILE RECEIVED, NOT USED`, with the file name and the reason. For this label only, the roll number is taken from the start of the file name; it is never used to match or fill anything. Students listed under "no sheet" really sent nothing.
+
+**Sheets for students who sent nothing.** Give the standard blank template together with the submissions folder:
+
+```powershell
+py .\generate_top_sheets.py --workbook ".\students.xlsx" --submissions ".\submissions" --template ".\template.docx"
+```
+
+(An interactive run asks "For students who sent no sheet, make one from a template? [y/N]" and opens a picker.) Every student who sent **no file at all** then gets a sheet made the other way: filled in from the workbook, with the question-wise marks and the **typed handwriting-style signature**, and the seal if you chose one. `run_report.csv` marks each of these rows `GENERATED (typed signature)` with the note "no sheet was submitted", and the summary lists them separately from the sheets students submitted.
+
+- Students whose file was received but could not be used are **not** replaced by a generated sheet, so their real signature is never swapped for a typed one.
+- A total too low to split under the section rules is not generated; the student is listed with the reason.
+- Use a **blank** template. Anything already in it, such as a picture or a signature, is copied onto every generated sheet.
+- If the template does not fit the config (a label is missing, for example), the submitted sheets are still completed, and the students who sent nothing are listed instead, with a warning.
+
 **Where the values are.** Sheets differ in how they lay out a field. In the CA2 sheet each label has its own cell and the value is in the cell to the right, so each field in `template_fields` says `"where": "next-cell"`. Where the value follows the label in the same paragraph (the default, `"after-label"`), leave it out. [`presets/ca2.json`](presets/ca2.json) is ready for the CA2 sheet. If no roll number can be read from any sheet, the program stops with a message pointing at this setting.
 
 **Section rules.** The sections ("answer any N") are asked once per sheet layout and remembered, as before. If the folder holds sheets with different layouts, each layout is asked about separately.
@@ -277,7 +294,8 @@ py .\generate_top_sheets.py --workbook ".\students.xlsx" --template ".\template.
 | Option | Meaning |
 | --- | --- |
 | `--config PATH` | Use another config file (default: `config.json` beside the script) |
-| `--submissions FOLDER` | Complete the sheets students filled in, instead of generating new ones (use instead of `--template`) |
+| `--submissions FOLDER` | Complete the sheets students filled in, instead of generating new ones for everyone |
+| `--template FILE` | Generate new sheets from this template. Together with `--submissions` it is used only for students who sent no sheet |
 | `--seal PATH` | Image of the official seal to stamp on every sheet. Without it, an interactive run asks whether to stamp one |
 | `--check` | Validate and report only |
 | `--no-prompt` | Skip the settings screen and use the config files as they are |
@@ -314,6 +332,8 @@ Problems with the workbook, config or template are all listed together, before a
 | --- | --- |
 | `The workbook has no column with the header(s) declared in the config` | A header differs from the config. Headers must match exactly, including spaces and capitals. Fix the workbook header, or the `columns` / `template_fields` entry in `config.json`. The message lists the headers it did find. |
 | `No roll number could be read from any of the N sheet(s)` | In submitted sheets the value is usually in the cell next to the label. Set `"where": "next-cell"` on the fields in the config, or use `presets/ca2.json`. |
+| `Bad CRC-32 for file 'word/media/...'` | A picture inside the student's file was saved with a wrong checksum. The program recovers it automatically and lists the sheet under "Sheets completed after recovering a picture". Nothing to do except look at the sheet. |
+| `FILE RECEIVED, NOT USED` (in the report) | The student sent a file, but it could not be used (see the reason beside it). Ask for a new copy. It is not the same as `NO SUBMISSION`. |
 | `could not be opened as a Word document (KeyError: "There is no item named 'word/media/...' in the archive")` | The student's file refers to a picture that is not inside it, usually after another program re-saved or re-zipped the file. The file is skipped. Ask the student to open it in Word, save it again as `.docx`, and resubmit. |
 | `'...' could not be read as a picture` | The seal file is not a valid image. Use a PNG or JPG. |
 | A white box shows around the seal | The seal is a JPG or a PNG without transparency. Use a PNG with a transparent background. |
@@ -343,6 +363,7 @@ Problems with the workbook, config or template are all listed together, before a
 - The Word PDF export cannot be exercised by the automated tests, which run on Linux and Windows without Word. PDFs made by LibreOffice can look slightly different from Word's.
 - The five signature fonts are Windows fonts.
 - The seal is stamped at the end of the document, not at a fixed place on a fixed page. If the last page is almost full, the seal can run past its bottom edge, so look at a finished sheet in Word. Only one seal image is used per run, and "already has a seal" is judged from the name or description of pictures in the sheet.
+- Pictures with a wrong checksum are recovered; any other damaged part makes the file unusable. A file that is not a Word file at all is skipped.
 - Completing submitted sheets reads the roll number from the one field you configure. It does not check that a signature is present, and text boxes and shapes are not read. A student's text is never corrected, only compared.
 
 ## Intended use
@@ -353,13 +374,14 @@ This tool prepares CA1 / CA2 top sheets from a workbook of marks. Please note wh
 - **In generate mode the typed signature is generated.** It is the student's name in a handwriting-style font, not a handwritten signature. Set `"signature": {"enabled": false}` in the config to leave it out.
 - **In submissions mode the program adds no signature at all.** The student's own signature, typed details and pictures stay exactly as the student made them, which is the better choice for anything official.
 
+- **Sheets made for students who sent nothing carry a generated signature.** It is the student's name in a handwriting-style font, not something the student signed. The run report marks these sheets `GENERATED (typed signature)` so they can always be told apart from sheets the students submitted.
 - **The seal is an authentication mark.** The program only stamps an image file that you give it, for that run, and never stores it. The file should be held by the person entitled to apply the seal, and sheets should be stamped only with that person's authority.
 
 Use the tool only where your institution permits sheets to be prepared this way, and do not present generated content as an examiner's or a student's original record. The software is provided as is, without warranty (see [LICENSE](LICENSE)).
 
 ## Version
 
-This is version 2.2.0. See [CHANGELOG.md](CHANGELOG.md) for what changed, or run `py .\generate_top_sheets.py --version`.
+This is version 2.3.0. See [CHANGELOG.md](CHANGELOG.md) for what changed, or run `py .\generate_top_sheets.py --version`.
 
 ## Notes
 

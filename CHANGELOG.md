@@ -3,6 +3,17 @@
 All notable changes to this project are listed here, newest first.
 The version number is also printed by `py .\generate_top_sheets.py --version`.
 
+## 2.3.0 - 2026-11-09
+
+### Added
+- Pictures saved with a wrong checksum (for example a checksum of zero, which some apps write) no longer make a student's file unusable. The picture is read exactly as it is, the sheet is completed, and the sheet is listed for a look. JPEGs and PNGs are checked, and the note says whether the picture "looks complete" or "may be damaged". Other damaged parts are still refused.
+- Students who sent no file at all can get a sheet made from the standard template, with workbook data, the question-wise marks and the typed signature (and the seal, if chosen): give `--template` together with `--submissions`, or answer the new question in an interactive run. The report marks them `GENERATED (typed signature)` with the note "no sheet was submitted".
+- A tip when roll numbers on submitted sheets are not in the workbook: add them and run again with `--existing skip`.
+
+### Changed
+- A student whose file was received but could not be used is reported as `FILE RECEIVED, NOT USED` (with the file name and the reason) instead of `NO SUBMISSION`, and is never replaced by a generated sheet. The roll number taken from the file name is used for this label only.
+- `--template` and `--submissions` can now be used together.
+
 ## 2.2.0 - 2026-11-07
 
 ### Added

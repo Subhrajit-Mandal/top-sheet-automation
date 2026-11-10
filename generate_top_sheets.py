@@ -20,13 +20,17 @@ import argparse
 import copy
 import csv
 import hashlib
+import io
 import json
 import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import zipfile
+import zlib
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -43,7 +47,7 @@ from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = HERE / "config.json"
@@ -1410,6 +1414,7 @@ class Job:
     write_docx: bool = True
     write_pdf: bool = True
     seal: str = ""
+    status: str = ""
     notes: list[str] = field(default_factory=list)
 
 
@@ -1612,6 +1617,91 @@ def review_settings(config: dict, changes: dict, *, template_full_marks: int | N
 
 EMPTY_ROLL = "field is empty"
 
+# Parts of a Word file that are only pictures. A wrong checksum on one of these is recoverable;
+# a wrong checksum anywhere else could mean the text itself is damaged, so that file is not used.
+PICTURE_PARTS = ("word/media/", "docProps/thumbnail")
+
+
+def read_member_unchecked(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Read one member of a zip file without trusting its stored checksum."""
+    handle = archive.fp
+    handle.seek(info.header_offset)
+    header = handle.read(30)
+    name_length, extra_length = struct.unpack("<HH", header[26:30])
+    handle.seek(info.header_offset + 30 + name_length + extra_length)
+    raw = handle.read(info.compress_size)
+    if info.compress_type == zipfile.ZIP_STORED:
+        return raw
+    if info.compress_type == zipfile.ZIP_DEFLATED:
+        return zlib.decompressobj(-15).decompress(raw)
+    raise ValueError(f"unsupported compression method {info.compress_type}")
+
+
+def png_is_intact(data: bytes) -> bool:
+    """A PNG carries its own checksum on every chunk, so it can be verified independently."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+    position = 8
+    while position + 12 <= len(data):
+        length = struct.unpack(">I", data[position:position + 4])[0]
+        end = position + 8 + length + 4
+        if end > len(data):
+            return False
+        if zlib.crc32(data[position + 4:end - 4]) & 0xFFFFFFFF != struct.unpack(">I", data[end - 4:end])[0]:
+            return False
+        if data[position + 4:position + 8] == b"IEND":
+            return True
+        position = end
+    return False
+
+
+def picture_verdict(name: str, data: bytes) -> str:
+    lower = name.casefold()
+    if lower.endswith((".jpg", ".jpeg")):
+        complete = data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+        return "the picture looks complete" if complete else "the picture may be damaged"
+    if lower.endswith(".png"):
+        return "the picture looks complete" if png_is_intact(data) else "the picture may be damaged"
+    return "the picture could not be checked"
+
+
+def rebuild_docx_with_valid_checksums(path: Path) -> tuple[bytes, list[str]]:
+    """Copy a Word file, recovering pictures whose stored checksum is wrong.
+
+    Some apps save pictures with a checksum of zero. The picture data is fine, but Python
+    refuses to read the file. Only pictures are recovered; anything else that fails is an error.
+    """
+    notes: list[str] = []
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            try:
+                data = source.read(info.filename)
+            except zipfile.BadZipFile as error:
+                if "CRC" not in str(error) or not info.filename.startswith(PICTURE_PARTS):
+                    raise zipfile.BadZipFile(
+                        f"the part '{info.filename}' is damaged and is not a picture ({error})") from error
+                try:
+                    data = read_member_unchecked(source, info)
+                except (zlib.error, ValueError, struct.error) as inner:
+                    raise zipfile.BadZipFile(
+                        f"the picture '{info.filename}' is damaged and cannot be read ({inner})") from inner
+                notes.append(f"picture '{info.filename}' had a wrong checksum and was recovered "
+                             f"({picture_verdict(info.filename, data)})")
+            target.writestr(info.filename, data)
+    return buffer.getvalue(), notes
+
+
+def open_document(path: Path) -> tuple[Document, list[str], bytes | None]:
+    """Open a Word file. Returns (document, notes about any repair, repaired bytes or None)."""
+    try:
+        return Document(path), [], None
+    except zipfile.BadZipFile as error:
+        if "CRC" not in str(error):
+            raise
+    data, notes = rebuild_docx_with_valid_checksums(path)
+    return Document(io.BytesIO(data)), notes, data
+
 
 @dataclass
 class Submission:
@@ -1625,6 +1715,7 @@ class Submission:
     allocation: dict[str, int] | None = None
     status: str = ""
     seal: str = ""
+    repaired: bytes | None = None
 
 
 def roll_entry(config: dict) -> dict:
@@ -1662,7 +1753,8 @@ def scan_submission(path: Path, config: dict, entry: dict) -> Submission:
     """Open one submitted sheet and read the roll number from it. Never raises."""
     submission = Submission(path)
     try:
-        document = Document(path)
+        document, repair_notes, submission.repaired = open_document(path)
+        submission.notes += repair_notes
     except Exception as error:
         submission.problem = f"could not be opened as a Word document ({type(error).__name__}: {error})"
         return submission
@@ -1692,7 +1784,8 @@ def same_value(a: str, b: str, column: str, config: dict) -> bool:
 def complete_submission(submission: Submission, config: dict, output_path: Path,
                         seal_path: Path | None = None) -> None:
     """Add what the student's sheet is missing. What the student wrote is never overwritten."""
-    document = Document(submission.path)
+    document = (Document(io.BytesIO(submission.repaired)) if submission.repaired is not None
+                else Document(submission.path))
     font = font_settings(config)
     student = submission.student
     marks_header = config["columns"]["marks_obtained"]
@@ -1733,7 +1826,13 @@ def complete_submission(submission: Submission, config: dict, output_path: Path,
     document.save(output_path)
 
 
-def write_submission_report(path: Path, submissions: list[Submission], missing: list[Student],
+def student_row(student: Student, marks_header: str, status: str, note: str = "", split: str = "",
+                seal: str = "", file: str = "") -> list:
+    return [student.roll, student.name, file, student.row, student.values.get(marks_header, ""),
+            split, status, seal, note]
+
+
+def write_submission_report(path: Path, submissions: list[Submission], extra_rows: list[list],
                             marks_header: str) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
@@ -1750,13 +1849,13 @@ def write_submission_report(path: Path, submissions: list[Submission], missing: 
                 student.row if student else "", student.values.get(marks_header, "") if student else "",
                 split, item.status or ("SKIPPED" if item.problem else ""), item.seal,
                 "; ".join(([item.problem] if item.problem else []) + item.notes)])
-        for student in missing:
-            writer.writerow([student.roll, student.name, "", student.row,
-                             student.values.get(marks_header, ""), "", "NO SUBMISSION", "", ""])
+        for row in extra_rows:
+            writer.writerow(row)
 
 
 def run_submissions(args: argparse.Namespace, config: dict, folder: Path, students: list[Student],
-                    warnings: list[str], input_fn: Callable[[str], str]) -> int:
+                    warnings: list[str], input_fn: Callable[[str], str],
+                    template_path: Path | None = None) -> int:
     entry = roll_entry(config)
     files, refused = list_submission_files(folder)
     info(f"Submissions: {len(files)} .docx file(s) in {folder}")
@@ -1841,33 +1940,76 @@ def run_submissions(args: argparse.Namespace, config: dict, folder: Path, studen
     if kept_existing:
         warnings.append(f"{kept_existing} file(s) already exist in the output folder and will be kept.")
     warnings += refused
-    if warnings:
-        report_problems("Warnings", warnings)
 
     done_roll = {roll_key(item.student.roll) for item in ready}
-    missing = [s for s in students if roll_key(s.roll) not in done_roll
-               and roll_key(s.roll) not in groups]
+    # A file that could not even be read still tells us, by its name, which student sent it.
+    # This is only used to label the report; it never matches or fills anything.
+    by_file_name: dict[str, list[Submission]] = {}
+    for item in scanned:
+        if item.problem and item.student is None:
+            key = roll_key(re.split(r"[_\s]", item.path.stem, maxsplit=1)[0])
+            if key in by_key:
+                by_file_name.setdefault(key, []).append(item)
+    missing = [s for s in students if roll_key(s.roll) not in done_roll and roll_key(s.roll) not in groups]
+    unusable = [s for s in missing if roll_key(s.roll) in by_file_name]
+    sent_nothing = [s for s in missing if roll_key(s.roll) not in by_file_name]
+
+    # Students who sent no file at all get a sheet made from the template, if one was given.
+    generate_jobs: list[Job] = []
+    generate_skipped: list[str] = []
+    template_marks: MarksTable | None = None
+    if template_path is not None and sent_nothing:
+        try:
+            template_marks, template_warnings = analyse_template(template_path, config)
+            warnings += template_warnings
+            template_sections = None
+            if template_marks:
+                if args.check and answers is None and not load_rules(rules_path).get(template_marks.fingerprint):
+                    info("\nSection rules are not set for the template yet; the next normal run will ask. "
+                         "Detected sections:")
+                    show_sections(template_marks, detect_sections(template_marks.questions))
+                else:
+                    template_sections = configure_sections(
+                        template_marks, config, rules_path, template_path.name, answers=answers,
+                        force_ask=args.ask_sections, save=not args.check, input_fn=input_fn)
+            planning = {**config, "unreachable_marks": "skip"}  # a total that cannot be split is skipped
+            generate_jobs, plan_problems, generate_skipped = plan_jobs(
+                sent_nothing, template_marks if template_sections else None, template_sections,
+                output_dir, planning, make_pdf)
+            warnings += plan_problems
+        except UserError as error:
+            warnings.append(f"Sheets could not be made from the template ({error}); "
+                            "the students who sent nothing are listed instead.")
+            generate_jobs, generate_skipped = [], []
+    if warnings:
+        report_problems("Warnings", warnings)
+    generating = {job.student.roll for job in generate_jobs}
+
     if args.check:
         if args.seal:
             for message in check_seal_image(args.seal):
                 info(f"  Seal warning: {message}")
             info(f"The seal image {args.seal.name} can be used.")
-        info(f"\nCheck finished: {len(ready)} sheet(s) could be completed, "
-             f"{sum(1 for i in scanned if i.problem)} would be skipped, "
-             f"{len(missing)} student(s) have no submission. No files were written.")
+        info(f"\nCheck finished: {len(ready)} submitted sheet(s) could be completed, "
+             f"{sum(1 for i in scanned if i.problem)} file(s) would be skipped, "
+             f"{len(unusable)} student(s) sent a file that cannot be used, "
+             f"{len(sent_nothing)} sent nothing"
+             + (f" ({len(generate_jobs)} would be made from the template)." if template_path else ".")
+             + " No files were written.")
         for item in scanned:
             if item.problem:
                 info(f"  skipped {item.path.name}: {item.problem}")
         return 0
 
-    seal_path, seal_warnings = choose_seal(
-        args, sum(1 for item in ready if item.status != "kept existing"), input_fn)
+    to_complete = [item for item in ready if item.status != "kept existing"]
+    to_generate = [job for job in generate_jobs if job.write_docx]
+    seal_path, seal_warnings = choose_seal(args, len(to_complete) + len(to_generate), input_fn)
     if seal_warnings:
         report_problems("Warnings about the seal image", seal_warnings)
     (output_dir / DOCX_FOLDER).mkdir(parents=True, exist_ok=True)
     if make_pdf:
         (output_dir / PDF_FOLDER).mkdir(parents=True, exist_ok=True)
-    info(f"\nCompleting {len(ready)} sheet(s)...")
+    info(f"\nCompleting {len(ready)} submitted sheet(s)...")
     written: list[Submission] = []
     for item in ready:
         if item.status == "kept existing":
@@ -1879,26 +2021,103 @@ def run_submissions(args: argparse.Namespace, config: dict, folder: Path, studen
         except Exception as error:
             item.problem = f"could not be completed ({type(error).__name__}: {error})"
 
+    generated: list[Job] = []
+    if to_generate:
+        info(f"Making {len(to_generate)} sheet(s) from the template for students who sent nothing...")
+    for job in to_generate:
+        try:
+            job.seal = create_docx(template_path, job.student, job.allocation, job.docx_path, config, seal_path)
+            job.status = "generated"
+            generated.append(job)
+        except Exception as error:
+            job.status = "failed"
+            job.notes.append(f"{type(error).__name__}: {error}")
+
     pdf_failures: list[str] = []
     if make_pdf:
         pairs = [(output_dir / DOCX_FOLDER / f"{i.stem}.docx", output_dir / PDF_FOLDER / f"{i.stem}.pdf")
                  for i in written]
+        pairs += [(job.docx_path, job.pdf_path) for job in generated if job.write_pdf]
         pdf_failures = export_pdfs(pairs, args.pdf_engine, args.soffice)
 
     skipped = [item for item in scanned if item.problem]
     differences = [(i, n) for i in scanned if not i.problem for n in i.notes if "workbook has" in n]
     filled = [(i, n) for i in scanned if not i.problem for n in i.notes if "was blank" in n]
     replaced = [(i, n) for i in scanned if not i.problem for n in i.notes if "replaced with" in n]
-    write_submission_report(output_dir / REPORT_FILENAME, scanned, missing, config["columns"]["marks_obtained"])
+    repaired = [(i, n) for i in scanned if not i.problem for n in i.notes if "wrong checksum" in n]
 
-    info(f"\nCompleted: {len(written)} sheet(s)" + (f", kept existing: {kept_existing}" if kept_existing else ""))
+    # --- rows for the students who have no completed submitted sheet
+    marks_header = config["columns"]["marks_obtained"]
+    signature_on = config["signature"]["enabled"]
+    order = [q.label for q in template_marks.questions] if template_marks else []
+    extra: list[list] = []
+    for student in unusable:
+        names = ", ".join(i.path.name for i in by_file_name[roll_key(student.roll)])
+        reasons = "; ".join(i.problem for i in by_file_name[roll_key(student.roll)])
+        extra.append(student_row(student, marks_header, "FILE RECEIVED, NOT USED",
+                                 f"a file named {names} was received but could not be used ({reasons})"))
+    job_for = {job.student.roll: job for job in generate_jobs}
+    for student in sent_nothing:
+        job = job_for.get(student.roll)
+        if job is None:
+            message = next((m for m in generate_skipped if f"(roll {student.roll}," in m), "")
+            if message:
+                extra.append(student_row(student, marks_header, "NO SUBMISSION", f"not made from the template: {message}"))
+            else:
+                extra.append(student_row(student, marks_header, "NO SUBMISSION"))
+            continue
+        split = "; ".join(f"{l}={job.allocation[l]}" for l in order if job.allocation and l in job.allocation)
+        if job.status == "generated":
+            label = "GENERATED (typed signature)" if signature_on else "GENERATED (no signature)"
+            note = ("no sheet was submitted; made from the template with a typed (generated) signature"
+                    if signature_on else "no sheet was submitted; made from the template without a signature")
+            extra.append(student_row(student, marks_header, label, note, split, job.seal))
+        elif job.status == "failed":
+            extra.append(student_row(student, marks_header, "GENERATION FAILED", "; ".join(job.notes)))
+        else:
+            extra.append(student_row(student, marks_header, "kept existing", "no sheet was submitted; the "
+                                     "sheet made earlier from the template was kept", split))
+    write_submission_report(output_dir / REPORT_FILENAME, scanned, extra, marks_header)
+
+    # --- what the person sees
+    info(f"\nCompleted: {len(written)} submitted sheet(s)" + (f", kept existing: {kept_existing}" if kept_existing else ""))
+    if template_path is not None:
+        info(f"Made from the template for students who sent nothing: {len(generated)}"
+             + (f" ({'typed signature' if signature_on else 'no signature'})" if generated else ""))
     if seal_path:
-        info(f"Seal: stamped on {sum(1 for i in written if i.seal == 'stamped')} of {len(written)} sheet(s) ({seal_path.name}).")
-        had = [i for i in written if i.seal == "already had a seal"]
+        stamped = sum(1 for i in written if i.seal == "stamped") + sum(1 for j in generated if j.seal == "stamped")
+        info(f"Seal: stamped on {stamped} of {len(written) + len(generated)} sheet(s) ({seal_path.name}).")
+        had = [i.path.name for i in written if i.seal == "already had a seal"] + \
+              [j.docx_path.name for j in generated if j.seal == "already had a seal"]
         if had:
-            report_problems("Sheets that already had a seal (not stamped again)", [i.path.name for i in had])
+            report_problems("Sheets that already had a seal (not stamped again)", had)
+    if repaired:
+        report_problems("Sheets completed after recovering a picture with a wrong checksum (please look at them)",
+                        [f"{i.path.name}: {n}" for i, n in repaired])
     if skipped:
         report_problems("Files that were not used", [f"{i.path.name}: {i.problem}" for i in skipped])
+        if any("is not in the workbook" in i.problem for i in skipped):
+            info("  Tip: if those roll numbers belong to students who should be on the list, add them to the "
+                 "workbook and run again with --existing skip, so only the new sheets are made.")
+    if unusable:
+        report_problems("Students who sent a file that could not be used",
+                        [f"{s.roll} {s.name}: {', '.join(i.path.name for i in by_file_name[roll_key(s.roll)])}"
+                         for s in unusable])
+    if generated:
+        listed = [f"{j.student.roll} {j.student.name}" for j in generated[:30]]
+        if len(generated) > 30:
+            listed.append(f"... and {len(generated) - 30} more (see {REPORT_FILENAME})")
+        report_problems("Sheets made from the template (no sheet was submitted)", listed)
+    failed = [j for j in generate_jobs if j.status == "failed"]
+    if failed:
+        report_problems("Sheets that could not be made from the template",
+                        [f"{j.student.roll} {j.student.name}: {'; '.join(j.notes)}" for j in failed])
+    not_made = [s for s in sent_nothing if s.roll not in generating]
+    if not_made:
+        listed = [f"{s.roll} {s.name}" for s in not_made[:30]]
+        if len(not_made) > 30:
+            listed.append(f"... and {len(not_made) - 30} more (see {REPORT_FILENAME})")
+        report_problems("Students in the workbook with no sheet", listed)
     if differences:
         report_problems("Details in the sheet that differ from the workbook (the sheet's text was kept)",
                         [f"{i.path.name}: {n}" for i, n in differences])
@@ -1906,15 +2125,10 @@ def run_submissions(args: argparse.Namespace, config: dict, folder: Path, studen
         report_problems("Blank fields filled from the workbook", [f"{i.path.name}: {n}" for i, n in filled])
     if replaced:
         report_problems("Marks fields that already held text (replaced)", [f"{i.path.name}: {n}" for i, n in replaced])
-    if missing:
-        listed = [f"{s.roll} {s.name}" for s in missing[:30]]
-        if len(missing) > 30:
-            listed.append(f"... and {len(missing) - 30} more (see {REPORT_FILENAME})")
-        report_problems("Students in the workbook with no submitted sheet", listed)
     for message in pdf_failures:
         info(f"  PDF problem: {message}")
     info(f"\nFiles are in: {output_dir}\nRun report: {output_dir / REPORT_FILENAME}")
-    return 1 if skipped or pdf_failures else 0
+    return 1 if skipped or pdf_failures or failed else 0
 
 
 # --------------------------------------------------------------------------
@@ -1953,12 +2167,13 @@ def choose_folder(label: str) -> Path:
 
 
 def choose_sources(args: argparse.Namespace, input_fn: Callable[[str], str]) -> tuple[Path | None, Path | None]:
-    """Returns (submissions folder, template). Exactly one of them is set."""
-    if args.submissions and args.template:
-        raise UserError("Use either --template (generate new sheets) or --submissions "
-                        "(complete sheets filled in by students), not both.")
+    """Returns (submissions folder, template).
+
+    Alone, a template means "generate new sheets". Together with a submissions folder it is used
+    only for the students who sent no sheet.
+    """
     if args.submissions:
-        return args.submissions, None
+        return args.submissions, args.template
     if args.template:
         return None, args.template
     info("\nWhat would you like to do?")
@@ -1968,16 +2183,29 @@ def choose_sources(args: argparse.Namespace, input_fn: Callable[[str], str]) -> 
         reply = input_fn("Choose 1 or 2 [1]: ").strip()
     except EOFError:
         reply = ""
-    if reply == "2":
-        return choose_folder("folder of the students' filled-in sheets"), None
-    return None, choose_input_file("top sheet template", (".docx",))
+    if reply != "2":
+        return None, choose_input_file("top sheet template", (".docx",))
+    folder = choose_folder("folder of the students' filled-in sheets")
+    try:
+        answer = input_fn("For students who sent no sheet, make one from a template? [y/N]: ")
+    except EOFError:
+        answer = ""
+    template = None
+    if answer.strip().casefold() in {"y", "yes"}:
+        try:
+            template = choose_input_file("top sheet template (for students who sent no sheet)", (".docx",))
+        except UserError:
+            info("No template was chosen, so students who sent no sheet will only be listed.")
+    return folder, template
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create one completed CA1 top sheet per student.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--workbook", type=Path, help="Excel workbook with the student data")
-    parser.add_argument("--template", type=Path, help="Word top-sheet template (to generate new sheets)")
+    parser.add_argument("--template", type=Path,
+                        help="Word top-sheet template (to generate new sheets; together with --submissions "
+                             "it is used for the students who sent no sheet)")
     parser.add_argument("--submissions", type=Path,
                         help="Folder of sheets filled in by students; they are completed instead of "
                              "generating new sheets (use instead of --template)")
@@ -2092,7 +2320,7 @@ def run(args: argparse.Namespace, input_fn: Callable[[str], str] = input) -> int
     warnings += data_warnings
 
     if submissions_dir is not None:
-        return run_submissions(args, config, submissions_dir, students, warnings, input_fn)
+        return run_submissions(args, config, submissions_dir, students, warnings, input_fn, template_path)
 
     marks, template_warnings = analyse_template(template_path, config)
     warnings += template_warnings
