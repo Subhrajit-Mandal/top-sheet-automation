@@ -111,7 +111,7 @@ def quiet(function, *args, **kwargs):
 
 class TempCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._dir = tempfile.TemporaryDirectory()
+        self._dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.dir = Path(self._dir.name)
 
     def tearDown(self) -> None:
@@ -650,7 +650,13 @@ class EndToEnd(TempCase):
 
     def test_shipped_config_matches_the_code_defaults(self):
         shipped = g.json.loads((g.HERE / "config.json").read_text(encoding="utf-8-sig"))
-        self.assertEqual(shipped, g.DEFAULT_CONFIG)
+        differing = sorted(k for k in set(shipped) | set(g.DEFAULT_CONFIG)
+                           if shipped.get(k) != g.DEFAULT_CONFIG.get(k))
+        self.assertEqual(
+            differing, [],
+            "config.json no longer matches the defaults built into the program for: "
+            f"{', '.join(differing)}. config.json is the shipped copy of the defaults; put your own values "
+            "in config.local.json (the settings screen writes it for you) or restore config.json.")
 
 
 class SettingsScreen(unittest.TestCase):
@@ -1246,16 +1252,16 @@ class Submissions(TempCase):
     def test_mode_question_when_nothing_is_chosen(self):
         argv = ["--workbook", str(self.workbook), "--config", str(self.config), "--output", str(self.out),
                 "--no-prompt", "--keep-docx-only"]
-        # no --template/--submissions: the program asks; reply 2 then a folder picker would open,
-        # so only the question itself is checked here
+        # no --template/--submissions: the program asks. The pickers are replaced, because a real
+        # dialog could block forever on a machine that has a desktop (a CI runner, for instance).
         args = g.parse_args(argv)
-        text = io.StringIO()
-        with redirect_stdout(text):
-            try:
-                g.choose_sources(args, feeder("2"))
-            except Exception:
-                pass                                # the folder picker needs a screen
-        self.assertIn("Complete sheets that students have filled in", text.getvalue())
+        with mock.patch.object(g, "choose_folder", return_value=Path("subs")) as folder, \
+                mock.patch.object(g, "choose_input_file", return_value=Path("t.docx")) as template:
+            result, text = quiet(g.choose_sources, args, feeder("2", "n"))
+        self.assertIn("Complete sheets that students have filled in", text)
+        self.assertEqual(result, (Path("subs"), None))
+        folder.assert_called_once()
+        template.assert_not_called()
 
 
 class NextCellLayout(TempCase):
@@ -1653,29 +1659,33 @@ class ChooseSources(TempCase):
     def args(self, *extra):
         return g.parse_args(["--workbook", "w.xlsx", *extra])
 
+    def choose(self, args, *replies):
+        result, _ = quiet(g.choose_sources, args, feeder(*replies))
+        return result
+
     def test_a_template_may_accompany_the_submissions(self):
-        folder, template = g.choose_sources(self.args("--submissions", "subs", "--template", "t.docx"), feeder())
+        folder, template = self.choose(self.args("--submissions", "subs", "--template", "t.docx"))
         self.assertEqual((folder, template), (Path("subs"), Path("t.docx")))
 
     def test_each_alone_is_unchanged(self):
-        self.assertEqual(g.choose_sources(self.args("--submissions", "subs"), feeder()), (Path("subs"), None))
-        self.assertEqual(g.choose_sources(self.args("--template", "t.docx"), feeder()), (None, Path("t.docx")))
+        self.assertEqual(self.choose(self.args("--submissions", "subs")), (Path("subs"), None))
+        self.assertEqual(self.choose(self.args("--template", "t.docx")), (None, Path("t.docx")))
 
     def test_the_questions_when_nothing_is_given(self):
         with mock.patch.object(g, "choose_folder", return_value=Path("subs")), \
                 mock.patch.object(g, "choose_input_file", return_value=Path("t.docx")):
-            self.assertEqual(g.choose_sources(self.args(), feeder("2", "y")), (Path("subs"), Path("t.docx")))
-            self.assertEqual(g.choose_sources(self.args(), feeder("2", "n")), (Path("subs"), None))
-            self.assertEqual(g.choose_sources(self.args(), feeder("2")), (Path("subs"), None))   # input closed
-            self.assertEqual(g.choose_sources(self.args(), feeder("1")), (None, Path("t.docx")))
-            self.assertEqual(g.choose_sources(self.args(), feeder()), (None, Path("t.docx")))
+            self.assertEqual(self.choose(self.args(), "2", "y"), (Path("subs"), Path("t.docx")))
+            self.assertEqual(self.choose(self.args(), "2", "n"), (Path("subs"), None))
+            self.assertEqual(self.choose(self.args(), "2"), (Path("subs"), None))   # input closed
+            self.assertEqual(self.choose(self.args(), "1"), (None, Path("t.docx")))
+            self.assertEqual(self.choose(self.args()), (None, Path("t.docx")))
 
     def test_cancelling_the_template_picker_keeps_the_submissions(self):
         with mock.patch.object(g, "choose_folder", return_value=Path("subs")), \
                 mock.patch.object(g, "choose_input_file", side_effect=g.UserError("none")):
-            with redirect_stdout(io.StringIO()) as shown:
-                self.assertEqual(g.choose_sources(self.args(), feeder("2", "y")), (Path("subs"), None))
-        self.assertIn("will only be listed", shown.getvalue())
+            result, text = quiet(g.choose_sources, self.args(), feeder("2", "y"))
+        self.assertEqual(result, (Path("subs"), None))
+        self.assertIn("will only be listed", text)
 
 
 class Release(TempCase):

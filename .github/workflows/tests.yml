@@ -4,9 +4,16 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    # A stuck run fails after 15 minutes with a clear "timed out" message instead of hanging for hours.
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"   # same text encoding on Windows and Linux
     strategy:
       fail-fast: false
       matrix:
